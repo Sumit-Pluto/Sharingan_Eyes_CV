@@ -1,0 +1,4 @@
+opencv-python-headless==4.8.0.76  # For working with OpenCV without GUI support
+ultralytics==8.0.136              # For YOLO model usage
+numpy==1.23.5                     # For numerical operations
+pygame==2.1.2                     # For Audio Playback
