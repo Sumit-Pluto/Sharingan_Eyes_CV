@@ -106,20 +106,6 @@ body {
 
 .intro-start:hover { background: #a31f24; }
 
-.intro-sound {
-  background: rgba(20, 16, 16, 0.75);
-  color: #fff;
-  border: 1px solid rgba(255, 255, 255, 0.55);
-  border-radius: 6px;
-  padding: 10px 22px;
-  font-size: 13px;
-  font-weight: 700;
-  letter-spacing: 2px;
-  cursor: pointer;
-}
-
-.intro-sound[hidden] { display: none; }
-
 .app-header {
   display: flex;
   align-items: flex-start;

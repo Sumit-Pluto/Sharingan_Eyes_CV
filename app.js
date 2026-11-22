@@ -38,14 +38,25 @@ const nextBtn = document.getElementById("nextBtn");
 const resetBtn = document.getElementById("resetBtn");
 const snapBtn = document.getElementById("snapBtn");
 // One Euro filter (Casiez et al.): adaptive low-pass that is heavy
-// when still (kills jitter) and light when moving (kills lag) —
-// the principled replacement for a fixed EMA + prediction hack.
+// when still (kills jitter and hand-shake tremor) and light when
+// moving fast (no lag on a real head/eye move). Tuned for phones,
+// whose hands add an ~8 Hz tremor on top of landmark noise: a low
+// resting cutoff (1.1) rejects that tremor, while a large beta (18)
+// opens the filter right up the moment the filtered velocity says
+// the movement is real. Two guards sit in front of it: a deadband
+// holds the output perfectly still under sub-pixel noise, and a
+// max-speed clamp stops one-frame landmark spikes from yanking the
+// eye across the face. Positions are then drawn with a short,
+// time-based velocity prediction in loop() (see latestEyes), which
+// — not frame-count guesswork — is what cancels detector latency.
 class OneEuro {
   // Coordinates are normalised (0..1), so velocities are numerically
-  // small: beta must be large (~10) or the filter stays in its slow
-  // regime during fast pupil moves and the overlay trails behind.
-  constructor(minCutoff = 1.8, beta = 10.0, dCutoff = 1.0) {
+  // small: beta must be large or the filter stays in its slow regime
+  // during fast pupil moves and the overlay trails behind.
+  constructor(minCutoff = 1.1, beta = 18.0, dCutoff = 1.0,
+              { deadband = 0.0006, maxSpeed = 1.7 } = {}) {
     this.minCutoff = minCutoff; this.beta = beta; this.dCutoff = dCutoff;
+    this.deadband = deadband; this.maxSpeed = maxSpeed;
     this.xPrev = null; this.dxPrev = 0; this.tPrev = null;
   }
   static alpha(cutoff, dt) {
@@ -54,23 +65,40 @@ class OneEuro {
   }
   filter(x, t) {
     if (this.xPrev === null) { this.xPrev = x; this.tPrev = t; return x; }
-    const dt = Math.max(1e-3, t - this.tPrev);
+    // Clamp dt: a dropped frame must not make the filter leap, and
+    // a duplicate timestamp must not divide by ~zero.
+    const dt = Math.min(0.1, Math.max(1 / 240, t - this.tPrev));
     this.tPrev = t;
-    const dx = (x - this.xPrev) / dt;
+    // Outlier clamp: the iris cannot cross the face in one frame.
+    let target = x;
+    const maxStep = this.maxSpeed * dt;
+    if (Math.abs(target - this.xPrev) > maxStep) {
+      target = this.xPrev + Math.sign(target - this.xPrev) * maxStep;
+    }
+    const dx = (target - this.xPrev) / dt;
     const aD = OneEuro.alpha(this.dCutoff, dt);
     const dxHat = aD * dx + (1 - aD) * this.dxPrev;
     this.dxPrev = dxHat;
+    // Deadband: under micro-noise (still face, shaking hand) hold
+    // exactly still instead of trembling around the true position.
+    if (Math.abs(target - this.xPrev) < this.deadband
+        && Math.abs(dxHat) < 0.05) return this.xPrev;
     const cutoff = this.minCutoff + this.beta * Math.abs(dxHat);
     const a = OneEuro.alpha(cutoff, dt);
-    this.xPrev = a * x + (1 - a) * this.xPrev;
+    this.xPrev = a * target + (1 - a) * this.xPrev;
     return this.xPrev;
   }
 }
-let eyeFilters = [];     // per-eye OneEuro sets {x, y, r}
-let prevFiltered = [];   // last filtered positions, for a small lead
+let eyeFilters = [];     // per-eye OneEuro sets {x, y, r, gx, gy, ...}
+let prevFiltered = [];   // last filtered centres, for velocity
+let prevFilteredAt = 0;  // timestamp (s) of prevFiltered
+let latestEyes = [];     // last filtered eyes, drawn every rAF
+let latestEyeAt = 0;     // performance.now() of the last detection
+let eyeVelocities = [];  // per-eye smoothed velocity (normalised/s)
 let headYaw = 0;         // from the facial transformation matrix
 let earBaseline = null;  // personal open-eye EAR, calibrated at start
 let earSamples = [];
+const IS_TOUCH = window.matchMedia?.("(pointer: coarse)")?.matches ?? false;
 
 let landmarker = null;
 let stream = null;
@@ -945,68 +973,133 @@ function drawBlood(eye, now, eyeIndex) {
 function loop() {
   if (!running) return;
   rafId = requestAnimationFrame(loop);
-  if (video.currentTime === lastVideoTime) return;
-  lastVideoTime = video.currentTime;
-
-  let result = null;
-  try { result = landmarker.detectForVideo(video, performance.now()); }
-  catch { return; }
-
-  if (video.videoWidth) {
-    // Cap the overlay canvas: phones can expose 4K streams and
-    // per-frame full-res work drains battery. Landmarks are
-    // normalised, so a smaller canvas loses no tracking accuracy.
-    const scale = Math.min(1, 960 / Math.max(video.videoWidth, video.videoHeight));
-    const tw = Math.round(video.videoWidth * scale);
-    const th = Math.round(video.videoHeight * scale);
-    if (canvas.width !== tw || canvas.height !== th) {
-      canvas.width = tw;
-      canvas.height = th;
-    }
-  }
-  ctx.clearRect(0, 0, canvas.width, canvas.height);
-
   const now = performance.now();
-  const landmarks = result?.faceLandmarks?.[0];
-  const eyesOpen = !!landmarks;
-  // Head pose from the transformation matrix (separates head turn
-  // from eye movement; used to correct foreshortening below).
-  const matrix = result?.facialTransformationMatrixes?.[0]?.data;
-  if (matrix?.length >= 16) {
-    headYaw = Math.atan2(matrix[8], matrix[10]);
-  }
-  if (landmarks) {
-    // One Euro filtering per eye: heavy smoothing when still,
-    // near-raw tracking when moving — no prediction hack needed.
-    const raw = eyeCentres(landmarks, canvas.width, canvas.height);
-    if (eyeFilters.length !== raw.length) {
-      eyeFilters = raw.map(() => ({
-        x: new OneEuro(), y: new OneEuro(), r: new OneEuro(),
-      }));
+  // Detection runs only on a new camera frame; drawing runs on every
+  // rAF. On a phone the detector may only manage 15-20 fps while the
+  // screen refreshes at 60: redrawing the last filtered eyes between
+  // detections (predicted a few ms ahead, below) is what stops the
+  // overlay visibly stepping and trailing behind the real eye.
+  const isNewFrame = video.currentTime !== lastVideoTime;
+  let result = null;
+  let landmarks = null;
+  let detectFailed = false;
+  if (isNewFrame) {
+    lastVideoTime = video.currentTime;
+    try { result = landmarker.detectForVideo(video, now); }
+    catch { result = null; detectFailed = true; }
+
+    if (video.videoWidth) {
+      // Cap the overlay canvas: phones can expose 4K streams and
+      // per-frame full-res work drains battery. Landmarks are
+      // normalised, so a smaller canvas loses no tracking accuracy.
+      const scale = Math.min(1, 960 / Math.max(video.videoWidth, video.videoHeight));
+      const tw = Math.round(video.videoWidth * scale);
+      const th = Math.round(video.videoHeight * scale);
+      if (canvas.width !== tw || canvas.height !== th) {
+        canvas.width = tw;
+        canvas.height = th;
+      }
     }
-    const t = now / 1000;
-    const newPrev = [];
-    const drawn = raw.map((eye, i) => {
-      const f = eyeFilters[i];
-      const fx = f.x.filter(eye.x, t);
-      const fy = f.y.filter(eye.y, t);
-      const prev = prevFiltered[i];
-      newPrev.push({ x: fx, y: fy });
-      // Small velocity lead: draw where the pupil is heading, which
-      // cancels most of the detector's own frame latency.
-      const lead = prev ? 0.45 : 0;
+    landmarks = result?.faceLandmarks?.[0];
+    // Head pose from the transformation matrix (separates head turn
+    // from eye movement; used to correct foreshortening below).
+    // Lightly smoothed: the raw matrix jitters under hand shake.
+    const matrix = result?.facialTransformationMatrixes?.[0]?.data;
+    if (matrix?.length >= 16) {
+      const yaw = Math.atan2(matrix[8], matrix[10]);
+      headYaw += (yaw - headYaw) * 0.35;
+    }
+    if (landmarks) {
+      const raw = eyeCentres(landmarks, canvas.width, canvas.height);
+      if (eyeFilters.length !== raw.length) {
+        eyeFilters = raw.map(() => ({
+          // Centre: anti-tremor at rest, near-raw on a real move.
+          x: new OneEuro(1.1, 18, 1.0, { deadband: 0.0006, maxSpeed: 1.7 }),
+          y: new OneEuro(1.1, 18, 1.0, { deadband: 0.0006, maxSpeed: 1.7 }),
+          // Radius and shape change slowly; filter them harder so
+          // the disc does not pulse with iris-ring noise.
+          r: new OneEuro(0.9, 6, 1.0, { deadband: 0.0003, maxSpeed: 0.7 }),
+          gx: new OneEuro(1.2, 8, 1.0, { deadband: 0.004, maxSpeed: 2.5 }),
+          gy: new OneEuro(1.2, 8, 1.0, { deadband: 0.004, maxSpeed: 2.5 }),
+          squash: new OneEuro(0.9, 6, 1.0, { deadband: 0.004, maxSpeed: 1.2 }),
+          open: new OneEuro(1.4, 8, 1.0, { deadband: 0.01, maxSpeed: 3 }),
+        }));
+        eyeVelocities = raw.map(() => ({ x: 0, y: 0 }));
+        prevFiltered = [];
+      }
+      const t = now / 1000;
+      const dtPrev = prevFilteredAt ? Math.min(0.1, Math.max(1 / 240, t - prevFilteredAt)) : 0;
+      const newPrev = [];
+      latestEyes = raw.map((eye, i) => {
+        const f = eyeFilters[i];
+        const fx = f.x.filter(eye.x, t);
+        const fy = f.y.filter(eye.y, t);
+        const prev = prevFiltered[i];
+        newPrev.push({ x: fx, y: fy });
+        // Smoothed velocity of the FILTERED centre (per second),
+        // for the time-based prediction at draw time. ~70 ms time
+        // constant: fast enough to follow a real move, slow enough
+        // that 8 Hz hand tremor mostly cancels out of it.
+        if (prev && dtPrev > 0) {
+          const v = eyeVelocities[i];
+          const a = 1 - Math.exp(-dtPrev / 0.07);
+          v.x += (Math.max(-1.6, Math.min(1.6, (fx - prev.x) / dtPrev)) - v.x) * a;
+          v.y += (Math.max(-1.6, Math.min(1.6, (fy - prev.y) / dtPrev)) - v.y) * a;
+        }
+        return {
+          ...eye,
+          x: fx,
+          y: fy,
+          r: f.r.filter(eye.r, t),
+          gx: f.gx.filter(eye.gx || 0, t),
+          gy: f.gy.filter(eye.gy || 0, t),
+          openness: f.open.filter(eye.openness, t),
+          // Anchor the eyelid contour to the filtered centre: the
+          // shape stays live, but its position inherits the centre's
+          // smoothing instead of jittering on its own landmarks.
+          contour: eye.contour?.map((p) => ({
+            x: p.x + (fx - eye.x), y: p.y + (fy - eye.y),
+          })),
+          vx: fx - eye.x, vy: fy - eye.y,   // residual, for reflection
+          // Head turn foreshortens the eye beyond the landmark ellipse.
+          squash: Math.min(f.squash.filter(eye.squash, t),
+                           0.60 + 0.40 * Math.abs(Math.cos(headYaw))),
+        };
+      });
+      prevFiltered = newPrev;
+      prevFilteredAt = t;
+      latestEyeAt = now;
+    } else if (!detectFailed) {
+      // A real "no face" clears the overlay; a transient detector
+      // error keeps the last eyes instead of blinking them off.
+      latestEyes = [];
+      eyeVelocities = [];
+    }
+  }
+
+  // Draw (every rAF): the last filtered eyes, predicted ahead by the
+  // smoothed velocity for at most 60 ms and at most ~7/1000 of the
+  // frame. That lead cancels detector + filter latency on a real
+  // move — the previous code led by 0.45 of a frame's displacement,
+  // which amplified shake and changed size with the frame rate.
+  // Older than 120 ms (face lost / detector stalled): draw as-is.
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  if (latestEyes.length) {
+    const ageMs = now - latestEyeAt;
+    const drawn = latestEyes.map((eye, i) => {
+      if (ageMs > 120) return eye;
+      const v = eyeVelocities[i] || { x: 0, y: 0 };
+      const leadS = Math.min(ageMs, 60) / 1000;
+      const dx = Math.max(-0.007, Math.min(0.007, v.x * leadS));
+      const dy = Math.max(-0.007, Math.min(0.007, v.y * leadS));
+      if (!dx && !dy) return eye;
       return {
         ...eye,
-        x: fx + (prev ? (fx - prev.x) * lead : 0),
-        y: fy + (prev ? (fy - prev.y) * lead : 0),
-        r: f.r.filter(eye.r, t),
-        vx: fx - eye.x, vy: fy - eye.y,   // residual, for reflection
-        // Head turn foreshortens the eye beyond the landmark ellipse.
-        squash: Math.min(eye.squash,
-                         0.60 + 0.40 * Math.abs(Math.cos(headYaw))),
+        x: eye.x + dx,
+        y: eye.y + dy,
+        contour: eye.contour?.map((p) => ({ x: p.x + dx, y: p.y + dy })),
       };
     });
-    prevFiltered = newPrev;
     // Under-overlay effects first: Rinnegan field and Mangekyo
     // strain veins live on the eye/skin beneath the Sharingan.
     drawn.forEach((eye) => {
@@ -1035,6 +1128,11 @@ function loop() {
       }
     }
   }
+
+  // Between detections (or on a transient detector error) there is
+  // nothing new to calibrate or blink on — the draw above is done.
+  if (!isNewFrame || detectFailed) return;
+  const eyesOpen = !!landmarks;
 
   // Personal calibration first: ~1.5s of open eyes at start sets
   // this user's EAR baseline. No stage changes until it is done.
@@ -1161,11 +1259,15 @@ async function prepare() {
     // Unconstrained requests can resolve to 4K on phones (heat,
     // battery, frame drops). Fall back to a bare request on devices
     // that reject the ideal constraints.
+    // Phones get a smaller feed: MediaPipe's landmark model works on
+    // a cropped face, so 640-ish pixels loses no useful accuracy but
+    // runs detection far more often — the single biggest latency win
+    // on mobile. Desktops keep the sharper 1280 feed they can afford.
     const wantCamera = {
       video: {
         facingMode: "user",
-        width: { ideal: 1280, max: 1280 },
-        height: { ideal: 720, max: 1280 },
+        width: IS_TOUCH ? { ideal: 640, max: 960 } : { ideal: 1280, max: 1280 },
+        height: IS_TOUCH ? { ideal: 640, max: 960 } : { ideal: 720, max: 1280 },
       },
       audio: false,
     };
@@ -1268,6 +1370,10 @@ function stop() {
   prevBtn.disabled = nextBtn.disabled = resetBtn.disabled = snapBtn.disabled = true;
   eyeFilters = [];
   prevFiltered = [];
+  prevFilteredAt = 0;
+  latestEyes = [];
+  latestEyeAt = 0;
+  eyeVelocities = [];
   closedSince = null;
   closedFrames = 0;
   earBaseline = null;
@@ -1278,40 +1384,63 @@ function stop() {
   setStatus("Stopped");
 }
 
-// Intro playback plan: FIRST run plays WITH voice. When it ends,
-// it restarts MUTED and loops forever (Loading screen ambience).
-// If the browser blocks autoplay-with-sound (common on a first ever
-// visit), fall back to muted play and offer TAP FOR SOUND, which
-// restarts the voiced first run.
-const introSoundBtn = document.getElementById("introSoundBtn");
-introVideo.addEventListener("ended", () => {
+// Intro playback plan (no sound prompt, by design): the
+// FIRST run plays WITH voice, from the start. When that run ends,
+// the same video restarts MUTED and loops forever as loading-screen
+// ambience. Browsers may block autoplay-with-sound on a first-ever
+// visit; then the muted loop starts silently, and the first touch or
+// keypress anywhere (except START, which enters the app) quietly
+// restarts the voiced run — the user is never asked to tap for sound.
+let introVoiceDone = false;
+let introVoicePlaying = false;
+let introVoiceTrying = false;
+
+function playIntroMutedLoop() {
   introVideo.muted = true;
   introVideo.loop = true;
   introVideo.currentTime = 0;
   introVideo.play().catch(() => {});
-  introSoundBtn.hidden = true;
-});
-(async () => {
-  introVideo.muted = false;
-  introVideo.volume = 1;
-  try {
-    await introVideo.play();       // first run, with voice
-    introSoundBtn.hidden = true;
-  } catch {
-    introVideo.muted = true;       // blocked: muted start, offer tap
-    introVideo.loop = false;
-    try { await introVideo.play(); } catch {}
-    introSoundBtn.hidden = false;
-  }
-})();
-introSoundBtn.addEventListener("click", async () => {
+}
+
+async function playIntroWithVoice() {
   introVideo.muted = false;
   introVideo.volume = 1;
   introVideo.loop = false;
-  introVideo.currentTime = 0;      // voiced first run from the start
-  try { await introVideo.play(); } catch {}
-  introSoundBtn.hidden = true;
+  introVideo.currentTime = 0;      // voiced run always from the start
+  await introVideo.play();
+  introVoicePlaying = true;
+}
+
+introVideo.addEventListener("ended", () => {
+  if (introVoiceDone) return;
+  introVoiceDone = true;           // voice has completed, exactly once
+  introVoicePlaying = false;
+  playIntroMutedLoop();
 });
+
+(async () => {
+  try {
+    await playIntroWithVoice();    // first run, with voice
+  } catch {
+    // Autoplay-with-sound blocked: muted loop now, voiced run on the
+    // first natural interaction — silently, with no prompt button.
+    playIntroMutedLoop();
+    const wakeOnFirstTouch = async (e) => {
+      if (introVoiceDone || introVoicePlaying || introVoiceTrying) return;
+      if (introScreen.hidden) return;
+      if (e.target?.closest?.("#introStartBtn")) return;   // enters app
+      introVoiceTrying = true;
+      try {
+        await playIntroWithVoice();
+        window.removeEventListener("pointerdown", wakeOnFirstTouch);
+        window.removeEventListener("keydown", wakeOnFirstTouch);
+      } catch { /* still blocked: stay on the muted loop */ }
+      introVoiceTrying = false;
+    };
+    window.addEventListener("pointerdown", wakeOnFirstTouch, { passive: true });
+    window.addEventListener("keydown", wakeOnFirstTouch);
+  }
+})();
 
 introStartBtn.addEventListener("click", () => {
   if (prepared) enterApp();

@@ -13,18 +13,18 @@
 </head>
 <body>
 
-<!-- Intro / loading screen: intro video loops while the model,
-     camera and calibration prepare behind it. START appears only
-     when everything is ready. -->
+<!-- Intro / loading screen: the intro video plays once WITH voice,
+     then loops muted while the model, camera and calibration prepare
+     behind it. START appears only when everything is ready. Playback
+     is driven from app.js (autoplay-with-sound needs its fallback). -->
 <div id="introScreen" class="intro-screen">
   <video id="introVideo" class="intro-video" src="intro.mp4"
-         autoplay muted playsinline preload="auto" disablepictureinpicture></video>
+         playsinline preload="auto" disablepictureinpicture></video>
   <div class="intro-bottom">
     <p id="introLoading" class="intro-loading">
       Loading<span class="dots"><span>.</span><span>.</span><span>.</span></span>
     </p>
     <p id="introError" class="intro-error" role="alert"></p>
-    <button id="introSoundBtn" class="intro-sound" type="button">TAP FOR SOUND</button>
     <button id="introStartBtn" class="intro-start" type="button" hidden>START</button>
   </div>
 </div>
