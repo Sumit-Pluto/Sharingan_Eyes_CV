@@ -96,6 +96,8 @@ let eyeVelocities = [];  // per-eye smoothed velocity (normalised/s)
 let eyeLatencyMs = 50;   // smoothed detection time, for prediction
 let lastDrawAt = 0;      // last overlay draw, for draw throttling
 let eyeLights = [];      // per-eye smoothed {f, warm} local light
+let motionOffset = { x: 0, y: 0 };  // optical-flow shift since anchor
+let framesSinceDetect = 99;         // video frames since last detection
 let headYaw = 0;         // from the facial transformation matrix
 let earBaseline = null;  // personal open-eye EAR, calibrated at start
 let earSamples = [];
@@ -109,6 +111,7 @@ let lastVideoTime = -1;
 let stages = [];        // processed canvases, background already stripped
 let audioFiles = [];
 let currentIndex = 0;
+let sharinganStarted = false;   // real eyes first, until the first blink
 let lastTransition = 0;
 let rotationStart = 0;
 let awakeningStart = 0;   // when the current stage awakened (glow flare)
@@ -604,6 +607,7 @@ function awakeningEnergy(now) {
 }
 
 function setStage(index, now) {
+  sharinganStarted = true;   // any stage shown means the Sharingan is awake
   currentIndex = ((index % stages.length) + stages.length) % stages.length;
   rotationStart = now;
   awakeningStart = now;
@@ -619,6 +623,9 @@ function setStage(index, now) {
 
 function tryTransition(now) {
   if (now - lastTransition < COOLDOWN_MS) return;
+  // First deliberate blink awakens Stage 1 onto the real eyes;
+  // every later one evolves to the next stage.
+  if (!sharinganStarted) { setStage(0, now); return; }
   setStage(currentIndex + 1, now);
 }
 
@@ -1084,6 +1091,79 @@ function drawBlood(eye, now, eyeIndex) {
   }
 }
 
+// --- Optical-flow motion layer ------------------------------------
+// Between landmark detections (which manage ~18fps on a phone), the
+// overlay used to sit frozen on an old frame while the displayed
+// video kept moving — the visible trail behind the pupil. Hand
+// shake and head motion move the whole face in the image, so this
+// layer measures that global shift directly from the camera pixels
+// on a tiny greyscale copy (block matching, ~1-3ms) and shifts the
+// overlay by it at camera rate. Each detection re-anchors (offset
+// resets to 0) and the landmark position corrects any drift.
+const motionCanvas = document.createElement("canvas");
+const motionCtx = motionCanvas.getContext("2d", { willReadFrequently: true });
+let motionPrev = null;   // {w, h, data:Uint8Array} last grey frame
+
+function captureMotionGray() {
+  if (!video.videoWidth) return null;
+  const mw = 96;
+  const mh = Math.max(48, Math.min(144, Math.round(mw * video.videoHeight / video.videoWidth)));
+  if (motionCanvas.width !== mw || motionCanvas.height !== mh) {
+    motionCanvas.width = mw; motionCanvas.height = mh; motionPrev = null;
+  }
+  try {
+    motionCtx.drawImage(video, 0, 0, mw, mh);
+    const d = motionCtx.getImageData(0, 0, mw, mh).data;
+    const gray = new Uint8Array(mw * mh);
+    for (let p = 0, q = 0; p < d.length; p += 4, q++) {
+      gray[q] = (d[p] * 77 + d[p + 1] * 150 + d[p + 2] * 29) >> 8;
+    }
+    return { w: mw, h: mh, data: gray };
+  } catch { return null; }
+}
+
+function updateMotionOffset() {
+  const cur = captureMotionGray();
+  if (!cur) return;
+  const prev = motionPrev;
+  motionPrev = cur;
+  if (!prev || prev.w !== cur.w || prev.h !== cur.h) return;
+  const W = cur.w, H = cur.h;
+  // Central template (the face lives there) searched over ±8px.
+  const x0 = Math.floor(W * 0.22), x1 = Math.floor(W * 0.78);
+  const y0 = Math.floor(H * 0.18), y1 = Math.floor(H * 0.82);
+  const ptsX = [], ptsY = [];
+  for (let y = y0; y < y1; y += 3) for (let x = x0; x < x1; x += 3) { ptsX.push(x); ptsY.push(y); }
+  let bestMean = Infinity, bestDx = 0, bestDy = 0, zeroMean = Infinity;
+  for (let dy = -8; dy <= 8; dy++) {
+    for (let dx = -8; dx <= 8; dx++) {
+      let sad = 0, n = 0;
+      for (let k = 0; k < ptsX.length; k++) {
+        const x = ptsX[k], y = ptsY[k];
+        const cx = x + dx, cy = y + dy;
+        if (cx < 0 || cy < 0 || cx >= W || cy >= H) continue;
+        sad += Math.abs(prev.data[y * W + x] - cur.data[cy * W + cx]);
+        n++;
+      }
+      if (!n) continue;
+      const mean = sad / n;
+      if (dx === 0 && dy === 0) zeroMean = mean;
+      if (mean < bestMean) { bestMean = mean; bestDx = dx; bestDy = dy; }
+    }
+  }
+  // Confidence gates: a poor match (scene change, blur, occlusion)
+  // or one barely better than no shift must not drag the eyes.
+  if (bestMean > 22) return;
+  if ((bestDx || bestDy) && bestMean > zeroMean * 0.92) return;
+  motionOffset.x += bestDx / W;
+  motionOffset.y += bestDy / H;
+  const mag = Math.hypot(motionOffset.x, motionOffset.y);
+  if (mag > 0.06) {   // drift cap until the next anchor corrects it
+    motionOffset.x *= 0.06 / mag;
+    motionOffset.y *= 0.06 / mag;
+  }
+}
+
 function loop() {
   if (!running) return;
   rafId = requestAnimationFrame(loop);
@@ -1097,8 +1177,20 @@ function loop() {
   let result = null;
   let landmarks = null;
   let detectFailed = false;
+  let detectedThisFrame = false;
   if (isNewFrame) {
     lastVideoTime = video.currentTime;
+    // Motion first (cheap): it shifts the overlay for THIS frame.
+    updateMotionOffset();
+    // Governor: phones detect every 2nd video frame and let the
+    // motion layer carry the frames between — detecting on every
+    // frame blocked the main thread so the tracker could never run
+    // at camera rate. Desktops can afford every frame.
+    framesSinceDetect++;
+    detectedThisFrame = framesSinceDetect >= (IS_TOUCH ? 2 : 1);
+    if (detectedThisFrame) framesSinceDetect = 0;
+  }
+  if (detectedThisFrame) {
     try { result = landmarker.detectForVideo(video, now); }
     catch { result = null; detectFailed = true; }
     // How long detection itself took: a result describes where the
@@ -1216,27 +1308,43 @@ function loop() {
       eyeVelocities = eyeVelocities.map(() => ({ x: 0, y: 0 }));
       prevFiltered = [];
     }
+    // This detection IS the anchor for the frame just captured:
+    // the motion layer starts accumulating again from here.
+    motionOffset.x = 0;
+    motionOffset.y = 0;
   }
 
   // Draw: at most every ~24 ms between detections (full-rate draws
   // would starve the detector of main-thread time on a phone). The
   // last filtered eyes are predicted ahead by the smoothed velocity
-  // for the result's age PLUS its measured detection latency — a
-  // result is already that old when it arrives, and drawing it raw
-  // is exactly the visible trail behind the pupil. Lead is capped
-  // (110 ms / 0.014 of frame) so a direction change cannot fling it.
+  // for the result's age PLUS its measured detection latency, PLUS
+  // the frame-to-frame motion the optical tracker measured (below).
+  // The old lead cap (0.014 of frame, ~10px) was itself a cause of
+  // trailing: a shaking hand moves 15-40px inside one detection
+  // cycle, so the predictor was never allowed to catch up. The cap
+  // is now 0.04, and the lead is gated by velocity confidence —
+  // slow/noisy velocity (tremor) gets almost no extrapolation,
+  // fast coherent motion gets the full lead to display time.
   if (!isNewFrame && now - lastDrawAt < 24) return;
   const drawNow = performance.now();
   lastDrawAt = drawNow;
   ctx.clearRect(0, 0, canvas.width, canvas.height);
-  if (latestEyes.length) {
+  // Until the first deliberate blink, draw NOTHING: the user sees
+  // their own real eyes. Tracking/calibration still run underneath.
+  if (latestEyes.length && sharinganStarted) {
     const ageMs = Math.max(0, drawNow - latestEyeAt);
-    const leadS = Math.min(ageMs + eyeLatencyMs, 110) / 1000;
+    const leadS = Math.min(ageMs + eyeLatencyMs, 130) / 1000;
     const drawn = latestEyes.map((eye, i) => {
       if (ageMs > 180) return eye;
       const v = eyeVelocities[i] || { x: 0, y: 0 };
-      const dx = Math.max(-0.014, Math.min(0.014, v.x * leadS));
-      const dy = Math.max(-0.014, Math.min(0.014, v.y * leadS));
+      const gate = Math.min(1, Math.hypot(v.x, v.y) / 0.15);
+      let dx = Math.max(-0.04, Math.min(0.04, v.x * leadS * gate));
+      let dy = Math.max(-0.04, Math.min(0.04, v.y * leadS * gate));
+      // Optical-flow layer: shift by the camera-frame motion
+      // measured since the anchor detection (hand shake moves the
+      // whole face; this updates at camera rate, not detect rate).
+      dx += motionOffset.x;
+      dy += motionOffset.y;
       if (!dx && !dy) return eye;
       return {
         ...eye,
@@ -1276,7 +1384,7 @@ function loop() {
 
   // Between detections (or on a transient detector error) there is
   // nothing new to calibrate or blink on — the draw above is done.
-  if (!isNewFrame || detectFailed) return;
+  if (!detectedThisFrame || detectFailed) return;
   const eyesOpen = !!landmarks;
 
   // Personal calibration first: ~1.5s of open eyes at start sets
@@ -1292,7 +1400,7 @@ function loop() {
     if (earSamples.length >= 40) {
       const sorted = [...earSamples].sort((a, b) => a - b);
       earBaseline = sorted[Math.floor(sorted.length / 2)];
-      setStatus("Calibrated. Blink to evolve");
+      setStatus("Calibrated. Close your eyes, hold, then open");
     }
   }
 
@@ -1307,7 +1415,9 @@ function loop() {
     closedFrames = 0;
     closedSince = null;
     eyesWereOpen = true;
-    if (earBaseline) setStatus("Eyes open");
+    if (earBaseline) setStatus(sharinganStarted
+      ? "Eyes open"
+      : "Your real eyes — close both eyes, hold, then open to awaken your Sharingan");
   } else if (closed || !eyesOpen) {
     if (eyesWereOpen) closedSince = now;
     closedFrames++;
@@ -1315,7 +1425,7 @@ function loop() {
     if (earBaseline) {
       setStatus(closed
         ? (closedSince && now - closedSince >= MIN_CLOSED_MS
-            ? "Release to evolve…"
+            ? (sharinganStarted ? "Release to evolve…" : "Release to awaken your Sharingan…")
             : "Hold… keep eyes closed")
         : "No face detected");
     }
@@ -1487,20 +1597,21 @@ function openCameraView() {
   introVideo.pause();
   introScreen.hidden = true;
   currentIndex = 0;
+  sharinganStarted = false;   // show the user's REAL eyes first
   rotationStart = performance.now();
   awakeningStart = performance.now();
   bloodStart = 0;
-  stageLabel.textContent = `Stage 1 / ${stages.length}`;
+  stageLabel.textContent = "Real eyes";
   running = true;
   startBtn.disabled = true;
   stopBtn.disabled = false;
   prevBtn.disabled = nextBtn.disabled = false;
   hideLoading();
-  setStatus(earBaseline ? "Eyes open" : "Calibrating: look at the camera, eyes open…");
-  // First stage audio, on this user gesture so the browser allows it.
-  if (audioFiles.length) {
-    new Audio(audioFiles[0]).play().catch(() => {});
-  }
+  setStatus(earBaseline
+    ? "Your real eyes — close both eyes, hold, then open to awaken your Sharingan"
+    : "Calibrating: look at the camera, eyes open…");
+  // No stage audio here: it plays when the first blink awakens
+  // Stage 1 (setStage), which is also a user-driven moment.
   loop();
 }
 
@@ -1534,6 +1645,11 @@ function stop() {
   eyeVelocities = [];
   lastDrawAt = 0;
   eyeLights = [];
+  motionOffset.x = 0;
+  motionOffset.y = 0;
+  framesSinceDetect = 99;
+  motionPrev = null;
+  sharinganStarted = false;
   closedSince = null;
   closedFrames = 0;
   earBaseline = null;
