@@ -102,6 +102,44 @@ let headYaw = 0;         // from the facial transformation matrix
 let earBaseline = null;  // personal open-eye EAR, calibrated at start
 let earSamples = [];
 const IS_TOUCH = window.matchMedia?.("(pointer: coarse)")?.matches ?? false;
+// Research-gate flags, parsed once: ?perf turns on the timing
+// harness (near-zero when absent), ?fxShade=0 falls back to the
+// old per-frame gradients instead of the baked shading sprites.
+const PERF = new URLSearchParams(location.search).has("perf");
+const FX_SHADE = new URLSearchParams(location.search).get("fxShade") !== "0";
+const perfLabel = document.getElementById("perfLabel");
+const perfCounters = { detect: 0, draw: 0, raf: 0 };
+const perfRings = {};
+for (const name of ["detect", "motion", "filter", "draw", "age"]) {
+  perfRings[name] = { data: new Float32Array(512), idx: 0, n: 0 };
+}
+function perfSample(name, value) {
+  if (!PERF) return;
+  const r = perfRings[name];
+  r.data[r.idx] = value;
+  r.idx = (r.idx + 1) % r.data.length;
+  r.n = Math.min(r.data.length, r.n + 1);
+}
+function perfStats(name) {
+  const r = perfRings[name];
+  if (!r.n) return null;
+  const a = Array.from(r.data.slice(0, r.n)).sort((x, y) => x - y);
+  const at = (q) => +a[Math.min(a.length - 1, Math.floor(q * a.length))].toFixed(2);
+  return { n: r.n, p50: at(0.5), p95: at(0.95), max: +a[a.length - 1].toFixed(2) };
+}
+window.__sharinganPerf = {
+  dump() {
+    return {
+      counters: { ...perfCounters },
+      detect: perfStats("detect"), motion: perfStats("motion"),
+      filter: perfStats("filter"), draw: perfStats("draw"), age: perfStats("age"),
+    };
+  },
+  reset() {
+    perfCounters.detect = perfCounters.draw = perfCounters.raf = 0;
+    for (const r of Object.values(perfRings)) { r.idx = 0; r.n = 0; }
+  },
+};
 
 let landmarker = null;
 let stream = null;
@@ -678,6 +716,44 @@ function traceSmoothContour(pts) {
   ctx.closePath();
 }
 
+// Baked shading sprites (made once, blitted per frame): the lid
+// gradient and limbal/dome shading used to be created as Canvas
+// gradients on every eye every frame. Baking them at 256px allows
+// richer multi-stop falloff, and per frame they cost one drawImage
+// each. Kept separate: neither rotates with the design (both are
+// drawn after the spin transform resets), and the lid layer's
+// alpha is modulated per frame by openness. ?fxShade=0 restores
+// the old per-frame gradients for A/B comparison.
+let shadeSprite = null, lidSprite = null;
+function makeShadeSprites() {
+  if (shadeSprite) return;
+  shadeSprite = document.createElement("canvas");
+  shadeSprite.width = shadeSprite.height = 256;
+  const g = shadeSprite.getContext("2d");
+  // Dome + limbal: transparent centre, darkening to the rim, with
+  // a faint dome light toward the upper left.
+  let grad = g.createRadialGradient(102, 96, 10, 128, 128, 128);
+  grad.addColorStop(0, "rgba(255, 255, 255, 0.07)");
+  grad.addColorStop(0.45, "rgba(255, 255, 255, 0)");
+  grad.addColorStop(0.75, "rgba(0, 0, 0, 0)");
+  grad.addColorStop(0.88, "rgba(0, 0, 0, 0.14)");
+  grad.addColorStop(0.96, "rgba(0, 0, 0, 0.26)");
+  grad.addColorStop(1, "rgba(0, 0, 0, 0.34)");
+  g.fillStyle = grad;
+  g.fillRect(0, 0, 256, 256);
+  lidSprite = document.createElement("canvas");
+  lidSprite.width = lidSprite.height = 256;
+  const l = lidSprite.getContext("2d");
+  // Lid shading SHAPE at full strength (fades over the top ~55%):
+  // drawn with globalAlpha = the frame's lidStrength.
+  grad = l.createLinearGradient(0, 0, 0, 141);
+  grad.addColorStop(0, "rgba(0, 0, 0, 1)");
+  grad.addColorStop(0.55, "rgba(0, 0, 0, 0.45)");
+  grad.addColorStop(1, "rgba(0, 0, 0, 0)");
+  l.fillStyle = grad;
+  l.fillRect(0, 0, 256, 256);
+}
+
 function drawEye(eye, now) {
   const w = canvas.width, h = canvas.height;
   // Corneal refraction: the iris seen through the cornea appears
@@ -831,21 +907,30 @@ function drawEye(eye, now) {
     }
     // 4) Eyelid shadow: the upper lid shades the top of the iris,
     // deepening as the eye closes (openness -> shadow strength).
+    // 5a) Limbal ring + dome: dark rim where iris meets sclera.
+    // Both are baked sprites now (see makeShadeSprites); the old
+    // per-frame gradients remain behind ?fxShade=0 for A/B.
     const lidStrength = 0.16 + 0.30 * (1 - (eye.openness ?? 1));
-    const lid = ctx.createLinearGradient(cx, cy - drawH / 2, cx, cy + drawH * 0.05);
-    lid.addColorStop(0, `rgba(0, 0, 0, ${lidStrength})`);
-    lid.addColorStop(1, "rgba(0, 0, 0, 0)");
-    ctx.globalAlpha = 1;
-    ctx.fillStyle = lid;
-    ctx.fillRect(cx - drawW / 2, cy - drawH / 2, drawW, drawH / 2);
-    // 5a) Limbal ring: the dark rim where iris meets the white of
-    // the eye, shading the sphere edge (replaces the sticker edge).
-    const shade = ctx.createRadialGradient(cx, cy, size * 0.18, cx, cy, size / 2);
-    shade.addColorStop(0, "rgba(0, 0, 0, 0)");
-    shade.addColorStop(0.78, "rgba(0, 0, 0, 0)");
-    shade.addColorStop(1, "rgba(0, 0, 0, 0.34)");
-    ctx.fillStyle = shade;
-    ctx.fillRect(cx - drawW / 2, cy - drawH / 2, drawW, drawH);
+    if (FX_SHADE) {
+      makeShadeSprites();
+      ctx.globalAlpha = Math.round(lidStrength / 0.05) * 0.05;   // quantized
+      ctx.drawImage(lidSprite, cx - drawW / 2, cy - drawH / 2, drawW, drawH);
+      ctx.globalAlpha = 1;
+      ctx.drawImage(shadeSprite, cx - drawW / 2, cy - drawH / 2, drawW, drawH);
+    } else {
+      const lid = ctx.createLinearGradient(cx, cy - drawH / 2, cx, cy + drawH * 0.05);
+      lid.addColorStop(0, `rgba(0, 0, 0, ${lidStrength})`);
+      lid.addColorStop(1, "rgba(0, 0, 0, 0)");
+      ctx.globalAlpha = 1;
+      ctx.fillStyle = lid;
+      ctx.fillRect(cx - drawW / 2, cy - drawH / 2, drawW, drawH / 2);
+      const shade = ctx.createRadialGradient(cx, cy, size * 0.18, cx, cy, size / 2);
+      shade.addColorStop(0, "rgba(0, 0, 0, 0)");
+      shade.addColorStop(0.78, "rgba(0, 0, 0, 0)");
+      shade.addColorStop(1, "rgba(0, 0, 0, 0.34)");
+      ctx.fillStyle = shade;
+      ctx.fillRect(cx - drawW / 2, cy - drawH / 2, drawW, drawH);
+    }
     // 5a2) Eyelash/lid shadow ON TOP of the disc (it used to be
     // drawn before the disc, which then covered it): a dark line
     // hugging the upper eyelid, so the top of the iris reads as
@@ -1167,6 +1252,7 @@ function updateMotionOffset() {
 function loop() {
   if (!running) return;
   rafId = requestAnimationFrame(loop);
+  if (PERF) perfCounters.raf++;
   const now = performance.now();
   // Detection runs only on a new camera frame; drawing runs on every
   // rAF. On a phone the detector may only manage 15-20 fps while the
@@ -1181,7 +1267,9 @@ function loop() {
   if (isNewFrame) {
     lastVideoTime = video.currentTime;
     // Motion first (cheap): it shifts the overlay for THIS frame.
+    const motionT0 = PERF ? performance.now() : 0;
     updateMotionOffset();
+    if (PERF) perfSample("motion", performance.now() - motionT0);
     // Governor: phones detect every 2nd video frame and let the
     // motion layer carry the frames between — detecting on every
     // frame blocked the main thread so the tracker could never run
@@ -1191,8 +1279,10 @@ function loop() {
     if (detectedThisFrame) framesSinceDetect = 0;
   }
   if (detectedThisFrame) {
+    const detectT0 = PERF ? performance.now() : 0;
     try { result = landmarker.detectForVideo(video, now); }
     catch { result = null; detectFailed = true; }
+    if (PERF) { perfSample("detect", performance.now() - detectT0); perfCounters.detect++; }
     // How long detection itself took: a result describes where the
     // eye WAS when its frame was captured, so the draw must predict
     // this far ahead (plus the result's age) to sit on the pupil NOW.
@@ -1220,6 +1310,7 @@ function loop() {
       headYaw += (yaw - headYaw) * 0.35;
     }
     if (landmarks) {
+      const filterT0 = PERF ? performance.now() : 0;
       const raw = eyeCentres(landmarks, canvas.width, canvas.height);
       if (eyeFilters.length !== raw.length) {
         eyeFilters = raw.map(() => ({
@@ -1296,6 +1387,7 @@ function loop() {
         const s = eyeLights[i];
         if (s) { eye.light = s.f; eye.warm = s.warm; }
       });
+      if (PERF) perfSample("filter", performance.now() - filterT0);
     } else if (!detectFailed) {
       // A real "no face" clears the overlay; a transient detector
       // error keeps the last eyes instead of blinking them off.
@@ -1328,11 +1420,14 @@ function loop() {
   if (!isNewFrame && now - lastDrawAt < 24) return;
   const drawNow = performance.now();
   lastDrawAt = drawNow;
+  const drawT0 = PERF ? drawNow : 0;
+  if (PERF) perfCounters.draw++;
   ctx.clearRect(0, 0, canvas.width, canvas.height);
   // Until the first deliberate blink, draw NOTHING: the user sees
   // their own real eyes. Tracking/calibration still run underneath.
   if (latestEyes.length && sharinganStarted) {
     const ageMs = Math.max(0, drawNow - latestEyeAt);
+    if (PERF) perfSample("age", ageMs);
     const leadS = Math.min(ageMs + eyeLatencyMs, 130) / 1000;
     const drawn = latestEyes.map((eye, i) => {
       if (ageMs > 180) return eye;
@@ -1381,6 +1476,7 @@ function loop() {
       }
     }
   }
+  if (PERF) perfSample("draw", performance.now() - drawT0);
 
   // Between detections (or on a transient detector error) there is
   // nothing new to calibrate or blink on — the draw above is done.
@@ -1435,6 +1531,11 @@ function loop() {
   frames++;
   if (now - fpsTimer >= 1000) {
     fpsLabel.textContent = `${frames} fps`;
+    if (PERF && perfLabel) {
+      const d = perfStats("detect"), dr = perfStats("draw"), ag = perfStats("age");
+      perfLabel.textContent =
+        `det ${d?.p95 ?? "-"}ms · draw ${dr?.p95 ?? "-"}ms · age ${ag?.p95 ?? "-"}ms`;
+    }
     // Auto-quality: sustained low FPS sheds the expensive extras
     // (grain, spin ghosts); recovering FPS restores them.
     if (frames < 20) fxReduced = true;
