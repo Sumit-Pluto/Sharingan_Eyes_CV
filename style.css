@@ -21,10 +21,14 @@ body {
 }
 
 .app {
-  max-width: 860px;
+  max-width: 960px;
   margin: 0 auto;
-  padding: 20px max(18px, env(safe-area-inset-left)) calc(32px + env(safe-area-inset-bottom));
-  padding-right: max(18px, env(safe-area-inset-right));
+  height: 100vh;
+  height: 100dvh;
+  display: flex;
+  flex-direction: column;
+  padding: 10px max(12px, env(safe-area-inset-left)) calc(10px + env(safe-area-inset-bottom));
+  padding-right: max(12px, env(safe-area-inset-right));
 }
 
 .intro-screen {
@@ -108,17 +112,25 @@ body {
 
 .app-header {
   display: flex;
-  align-items: flex-start;
+  align-items: center;
   justify-content: space-between;
-  gap: 16px;
+  gap: 12px;
+  padding: 2px 0 8px;
+  width: 100%;
+  min-width: 0;
 }
+
+.app-header h1 { min-width: 0; }
+.app-header .help-btn { flex-shrink: 0; }
 
 .help-btn {
   background: var(--panel);
   border: 1px solid var(--line);
   color: var(--ink);
   white-space: nowrap;
-  margin-top: 6px;
+  padding: 6px 14px;
+  min-height: 34px;
+  font-size: 13px;
 }
 
 .help-modal {
@@ -151,6 +163,32 @@ body {
 .help-card h2 { margin: 0 0 10px; font-size: 21px; }
 .help-card ol { margin: 0 0 10px; padding-left: 20px; }
 
+/* Framing guide shown with the first-time help: the illustration
+   has a transparent background, so it sits on a light plate to
+   stay clear on the dark card. Kept compact — the card scrolls
+   on small phones, and the steps below must stay easy to reach. */
+.help-figure {
+  margin: 0 0 14px;
+  background: #f7f3ee;
+  border-radius: 10px;
+  padding: 12px 14px 10px;
+  text-align: center;
+}
+
+.help-figure img {
+  display: block;
+  margin: 0 auto;
+  width: min(150px, 48vw);
+  height: auto;
+}
+
+.help-figure figcaption {
+  color: #3a2d2a;
+  font-size: 13.5px;
+  line-height: 1.45;
+  margin-top: 8px;
+}
+
 .help-close {
   background: var(--accent);
   color: #fff;
@@ -162,13 +200,11 @@ body {
 }
 
 header h1 {
-  margin: 0 0 6px;
-  font-size: clamp(24px, 6vw, 34px);
+  margin: 0;
+  font-size: clamp(20px, 5vw, 26px);
   font-weight: 700;
   letter-spacing: 0.5px;
 }
-
-.sub { margin: 0 0 20px; color: var(--muted); font-size: 15px; }
 
 .stage-wrap {
   position: relative;
@@ -176,20 +212,12 @@ header h1 {
   border: 1px solid var(--line);
   border-radius: 10px;
   overflow: hidden;
-  /* Mobile first: front cameras are portrait, so a portrait frame
-     avoids cropping the eyes away with object-fit: cover. */
-  aspect-ratio: 3 / 4;
-  max-height: 72vh;
-  max-height: 72dvh;
-  margin: 0 auto;
+  /* The camera is the screen: it takes every pixel left between
+     the slim header and the one-row controls at the bottom. The
+     video fills it with object-fit: cover, so no aspect lock. */
+  flex: 1 1 auto;
+  min-height: 0;
   width: 100%;
-}
-
-@media (min-width: 640px) {
-  .stage-wrap {
-    aspect-ratio: 4 / 3;
-    max-height: none;
-  }
 }
 
 .stage-wrap video,
@@ -267,9 +295,21 @@ header h1 {
 .controls {
   display: flex;
   align-items: center;
-  gap: 10px;
-  margin-top: 16px;
-  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 10px;
+  flex-wrap: nowrap;
+  width: 100%;
+  min-width: 0;
+}
+
+.controls button {
+  flex: 1 1 0%;
+  min-width: 0;
+  overflow: hidden;
+  padding: 8px 4px;
+  min-height: 40px;
+  font-size: 14px;
+  white-space: nowrap;
 }
 
 button {
@@ -286,27 +326,47 @@ button {
   -webkit-tap-highlight-color: transparent;
 }
 
-/* Coarse pointers (phones/tablets): roomier tap targets. */
+/* Coarse pointers (phones/tablets): still one row, just a
+   slightly taller tap target — the row must never wrap. */
 @media (pointer: coarse) {
-  .controls { gap: 12px; }
-  .controls button {
-    padding: 12px 20px;
-    font-size: 16px;
-  }
+  .controls button { min-height: 44px; }
 }
 
 button:hover:not(:disabled) { background: var(--accent-dark); }
 button:disabled { opacity: 0.45; cursor: default; }
 
-#stopBtn, #prevBtn, #nextBtn, #resetBtn, #snapBtn {
+#stopBtn, #prevBtn, #nextBtn {
   background: var(--panel); border: 1px solid var(--line); color: var(--ink);
 }
 
-.stage-label { font-weight: 700; font-size: 15px; }
-.fps-label { color: var(--muted); font-size: 13px; }
+/* Stage / FPS now live as small badges over the camera, so the
+   bottom row holds nothing but the four buttons. */
+.stage-label {
+  position: absolute;
+  top: 10px;
+  left: 10px;
+  z-index: 3;
+  background: rgba(0, 0, 0, 0.65);
+  padding: 5px 9px;
+  border-radius: 6px;
+  font-weight: 700;
+  font-size: 13px;
+}
+.fps-label {
+  position: absolute;
+  top: 10px;
+  right: 10px;
+  z-index: 3;
+  background: rgba(0, 0, 0, 0.65);
+  padding: 5px 9px;
+  border-radius: 6px;
+  color: var(--muted);
+  font-size: 12px;
+}
+.fps-label:empty { display: none; }
 
-.hint { color: var(--muted); font-size: 14px; line-height: 1.6; margin-top: 16px; }
-.error { color: #ff8a80; font-size: 14px; min-height: 18px; white-space: pre-line; }
+.error { color: #ff8a80; font-size: 13px; margin: 6px 0 0; white-space: pre-line; }
+.error:empty { display: none; }
 
 
 @media (prefers-reduced-motion: reduce) {

@@ -35,8 +35,6 @@ const startBtn = document.getElementById("startBtn");
 const stopBtn = document.getElementById("stopBtn");
 const prevBtn = document.getElementById("prevBtn");
 const nextBtn = document.getElementById("nextBtn");
-const resetBtn = document.getElementById("resetBtn");
-const snapBtn = document.getElementById("snapBtn");
 // One Euro filter (Casiez et al.): adaptive low-pass that is heavy
 // when still (kills jitter and hand-shake tremor) and light when
 // moving fast (no lag on a real head/eye move). Tuned for phones,
@@ -95,6 +93,8 @@ let prevFilteredAt = 0;  // timestamp (s) of prevFiltered
 let latestEyes = [];     // last filtered eyes, drawn every rAF
 let latestEyeAt = 0;     // performance.now() of the last detection
 let eyeVelocities = [];  // per-eye smoothed velocity (normalised/s)
+let eyeLatencyMs = 50;   // smoothed detection time, for prediction
+let lastDrawAt = 0;      // last overlay draw, for draw throttling
 let headYaw = 0;         // from the facial transformation matrix
 let earBaseline = null;  // personal open-eye EAR, calibrated at start
 let earSamples = [];
@@ -151,7 +151,7 @@ const fibreCanvas = (() => {   // radial iris fibres, rotates with the eye
   return c;
 })();
 
-let fxReduced = false;   // auto-quality: drops grain/ripples when slow
+let fxReduced = IS_TOUCH;   // phones start lite: grain/ripples cost frames
 
 function updateLightFactor() {
   // Average luminance of the live feed, sampled cheaply every so
@@ -436,7 +436,9 @@ async function initLandmarker() {
     runningMode: "VIDEO",
     numFaces: 1,
     outputFaceBlendshapes: true,
-    outputFacialTransformationMatrixes: true,
+    // Phones skip the pose matrix (only a cosmetic squash input):
+    // less work per detection means detections land sooner.
+    outputFacialTransformationMatrixes: !IS_TOUCH,
   });
   try { return await make("GPU"); }
   catch {
@@ -662,7 +664,7 @@ function drawEye(eye, now) {
     ctx.strokeStyle = "rgba(0, 0, 0, 0.38)";
     ctx.lineWidth = Math.max(1.5, size * 0.055);
     ctx.shadowColor = "rgba(0, 0, 0, 0.5)";
-    ctx.shadowBlur = size * 0.08;
+    ctx.shadowBlur = IS_TOUCH ? 0 : size * 0.08;   // shadowBlur is dear on phones
     ctx.lineCap = "round";
     ctx.beginPath();
     // Upper lid runs from one corner over the top to the other:
@@ -700,7 +702,8 @@ function drawEye(eye, now) {
   }
   // Live in the same photo as the face: slight blur, desaturation
   // and brightness matched to the webcam feed (sampled in the loop).
-  ctx.filter = `blur(0.4px) brightness(${lightFactor.toFixed(3)}) saturate(0.88)`;
+  // Canvas filters are very expensive on phone GPUs: skip on touch.
+  ctx.filter = IS_TOUCH ? "none" : `blur(0.4px) brightness(${lightFactor.toFixed(3)}) saturate(0.88)`;
   // Spin motion blur: while the awakening spin is fast, ghost the
   // image at trailing angles instead of one crisp CGI rotation.
   const spinning = motion.mode === "spin"
@@ -717,11 +720,14 @@ function drawEye(eye, now) {
   }
   ctx.drawImage(img, -size / 2, -size / 2, size, size);
   // Iris fibre texture, rotating with the design (not painted flat).
-  ctx.globalAlpha = 0.13;
-  ctx.globalCompositeOperation = "overlay";
-  ctx.drawImage(fibreCanvas, -size / 2, -size / 2, size, size);
-  ctx.globalCompositeOperation = "source-over";
-  ctx.globalAlpha = OPACITY;
+  // Skipped on touch, where the extra blended blit costs frames.
+  if (!IS_TOUCH) {
+    ctx.globalAlpha = 0.13;
+    ctx.globalCompositeOperation = "overlay";
+    ctx.drawImage(fibreCanvas, -size / 2, -size / 2, size, size);
+    ctx.globalCompositeOperation = "source-over";
+    ctx.globalAlpha = OPACITY;
+  }
   ctx.filter = "none";
   ctx.setTransform(1, 0, 0, 1, 0, 0);
   // Glow INSIDE the circle only: a soft red brightening clipped to
@@ -987,12 +993,16 @@ function loop() {
     lastVideoTime = video.currentTime;
     try { result = landmarker.detectForVideo(video, now); }
     catch { result = null; detectFailed = true; }
+    // How long detection itself took: a result describes where the
+    // eye WAS when its frame was captured, so the draw must predict
+    // this far ahead (plus the result's age) to sit on the pupil NOW.
+    eyeLatencyMs += (Math.min(120, performance.now() - now) - eyeLatencyMs) * 0.2;
 
     if (video.videoWidth) {
       // Cap the overlay canvas: phones can expose 4K streams and
       // per-frame full-res work drains battery. Landmarks are
       // normalised, so a smaller canvas loses no tracking accuracy.
-      const scale = Math.min(1, 960 / Math.max(video.videoWidth, video.videoHeight));
+      const scale = Math.min(1, (IS_TOUCH ? 720 : 960) / Math.max(video.videoWidth, video.videoHeight));
       const tw = Math.round(video.videoWidth * scale);
       const th = Math.round(video.videoHeight * scale);
       if (canvas.width !== tw || canvas.height !== th) {
@@ -1014,8 +1024,12 @@ function loop() {
       if (eyeFilters.length !== raw.length) {
         eyeFilters = raw.map(() => ({
           // Centre: anti-tremor at rest, near-raw on a real move.
-          x: new OneEuro(1.1, 18, 1.0, { deadband: 0.0006, maxSpeed: 1.7 }),
-          y: new OneEuro(1.1, 18, 1.0, { deadband: 0.0006, maxSpeed: 1.7 }),
+          // Phones run a faster tuning (speed is the priority there);
+          // prediction below, not raw looseness, does most of the work.
+          x: new OneEuro(IS_TOUCH ? 1.6 : 1.1, IS_TOUCH ? 24 : 18, 1.0,
+                         { deadband: 0.0005, maxSpeed: IS_TOUCH ? 2.2 : 1.7 }),
+          y: new OneEuro(IS_TOUCH ? 1.6 : 1.1, IS_TOUCH ? 24 : 18, 1.0,
+                         { deadband: 0.0005, maxSpeed: IS_TOUCH ? 2.2 : 1.7 }),
           // Radius and shape change slowly; filter them harder so
           // the disc does not pulse with iris-ring noise.
           r: new OneEuro(0.9, 6, 1.0, { deadband: 0.0003, maxSpeed: 0.7 }),
@@ -1043,8 +1057,8 @@ function loop() {
         if (prev && dtPrev > 0) {
           const v = eyeVelocities[i];
           const a = 1 - Math.exp(-dtPrev / 0.07);
-          v.x += (Math.max(-1.6, Math.min(1.6, (fx - prev.x) / dtPrev)) - v.x) * a;
-          v.y += (Math.max(-1.6, Math.min(1.6, (fy - prev.y) / dtPrev)) - v.y) * a;
+          v.x += (Math.max(-2.0, Math.min(2.0, (fx - prev.x) / dtPrev)) - v.x) * a;
+          v.y += (Math.max(-2.0, Math.min(2.0, (fy - prev.y) / dtPrev)) - v.y) * a;
         }
         return {
           ...eye,
@@ -1068,7 +1082,7 @@ function loop() {
       });
       prevFiltered = newPrev;
       prevFilteredAt = t;
-      latestEyeAt = now;
+      latestEyeAt = performance.now();   // when the result landed
     } else if (!detectFailed) {
       // A real "no face" clears the overlay; a transient detector
       // error keeps the last eyes instead of blinking them off.
@@ -1077,21 +1091,25 @@ function loop() {
     }
   }
 
-  // Draw (every rAF): the last filtered eyes, predicted ahead by the
-  // smoothed velocity for at most 60 ms and at most ~7/1000 of the
-  // frame. That lead cancels detector + filter latency on a real
-  // move — the previous code led by 0.45 of a frame's displacement,
-  // which amplified shake and changed size with the frame rate.
-  // Older than 120 ms (face lost / detector stalled): draw as-is.
+  // Draw: at most every ~24 ms between detections (full-rate draws
+  // would starve the detector of main-thread time on a phone). The
+  // last filtered eyes are predicted ahead by the smoothed velocity
+  // for the result's age PLUS its measured detection latency — a
+  // result is already that old when it arrives, and drawing it raw
+  // is exactly the visible trail behind the pupil. Lead is capped
+  // (110 ms / 0.014 of frame) so a direction change cannot fling it.
+  if (!isNewFrame && now - lastDrawAt < 24) return;
+  const drawNow = performance.now();
+  lastDrawAt = drawNow;
   ctx.clearRect(0, 0, canvas.width, canvas.height);
   if (latestEyes.length) {
-    const ageMs = now - latestEyeAt;
+    const ageMs = Math.max(0, drawNow - latestEyeAt);
+    const leadS = Math.min(ageMs + eyeLatencyMs, 110) / 1000;
     const drawn = latestEyes.map((eye, i) => {
-      if (ageMs > 120) return eye;
+      if (ageMs > 180) return eye;
       const v = eyeVelocities[i] || { x: 0, y: 0 };
-      const leadS = Math.min(ageMs, 60) / 1000;
-      const dx = Math.max(-0.007, Math.min(0.007, v.x * leadS));
-      const dy = Math.max(-0.007, Math.min(0.007, v.y * leadS));
+      const dx = Math.max(-0.014, Math.min(0.014, v.x * leadS));
+      const dy = Math.max(-0.014, Math.min(0.014, v.y * leadS));
       if (!dx && !dy) return eye;
       return {
         ...eye,
@@ -1103,17 +1121,17 @@ function loop() {
     // Under-overlay effects first: Rinnegan field and Mangekyo
     // strain veins live on the eye/skin beneath the Sharingan.
     drawn.forEach((eye) => {
-      drawRinneganField(eye, now);
-      drawVeins(eye, now);
+      drawRinneganField(eye, drawNow);
+      drawVeins(eye, drawNow);
     });
-    for (const eye of drawn) drawEye(eye, now);
+    for (const eye of drawn) drawEye(eye, drawNow);
     // Amaterasu: black blood flows from both eyes on stages 8 and 9.
-    if (bloodStart) drawn.forEach((eye, i) => drawBlood(eye, now, i));
+    if (bloodStart) drawn.forEach((eye, i) => drawBlood(eye, drawNow, i));
 
     // Almighty Push: one expanding shockwave ring from the face when
     // the Rinnegan (stage 11) awakens.
     if (currentIndex === 10 && drawn.length) {
-      const energy = awakeningEnergy(now);
+      const energy = awakeningEnergy(drawNow);
       if (energy > 0) {
         const p = 1 - Math.sqrt(energy);
         const mx = drawn.reduce((s, e) => s + (1 - e.x), 0) / drawn.length * canvas.width;
@@ -1183,7 +1201,7 @@ function loop() {
     // Auto-quality: sustained low FPS sheds the expensive extras
     // (grain, spin ghosts, ripples); recovering FPS restores them.
     if (frames < 20) fxReduced = true;
-    else if (frames > 26) fxReduced = false;
+    else if (frames > 26 && !IS_TOUCH) fxReduced = false;
     frames = 0; fpsTimer = now;
   }
 }
@@ -1260,14 +1278,14 @@ async function prepare() {
     // battery, frame drops). Fall back to a bare request on devices
     // that reject the ideal constraints.
     // Phones get a smaller feed: MediaPipe's landmark model works on
-    // a cropped face, so 640-ish pixels loses no useful accuracy but
+    // a cropped face, so 480-ish pixels loses no useful accuracy but
     // runs detection far more often — the single biggest latency win
     // on mobile. Desktops keep the sharper 1280 feed they can afford.
     const wantCamera = {
       video: {
         facingMode: "user",
-        width: IS_TOUCH ? { ideal: 640, max: 960 } : { ideal: 1280, max: 1280 },
-        height: IS_TOUCH ? { ideal: 640, max: 960 } : { ideal: 720, max: 1280 },
+        width: IS_TOUCH ? { ideal: 480, max: 640 } : { ideal: 1280, max: 1280 },
+        height: IS_TOUCH ? { ideal: 480, max: 640 } : { ideal: 720, max: 1280 },
       },
       audio: false,
     };
@@ -1336,7 +1354,7 @@ function openCameraView() {
   running = true;
   startBtn.disabled = true;
   stopBtn.disabled = false;
-  prevBtn.disabled = nextBtn.disabled = resetBtn.disabled = snapBtn.disabled = false;
+  prevBtn.disabled = nextBtn.disabled = false;
   hideLoading();
   setStatus(earBaseline ? "Eyes open" : "Calibrating: look at the camera, eyes open…");
   // First stage audio, on this user gesture so the browser allows it.
@@ -1367,13 +1385,14 @@ function stop() {
   ctx.clearRect(0, 0, canvas.width, canvas.height);
   startBtn.disabled = false;
   stopBtn.disabled = true;
-  prevBtn.disabled = nextBtn.disabled = resetBtn.disabled = snapBtn.disabled = true;
+  prevBtn.disabled = nextBtn.disabled = true;
   eyeFilters = [];
   prevFiltered = [];
   prevFilteredAt = 0;
   latestEyes = [];
   latestEyeAt = 0;
   eyeVelocities = [];
+  lastDrawAt = 0;
   closedSince = null;
   closedFrames = 0;
   earBaseline = null;
@@ -1458,8 +1477,7 @@ startBtn.addEventListener("click", start);
 stopBtn.addEventListener("click", stop);
 nextBtn.addEventListener("click", () => setStage(currentIndex + 1, performance.now()));
 prevBtn.addEventListener("click", () => setStage(currentIndex - 1, performance.now()));
-resetBtn.addEventListener("click", () => setStage(0, performance.now()));
-snapBtn.addEventListener("click", snapshot);
+// Reset (r) and Snapshot (s) stay on the keyboard, per the Help card.
 window.addEventListener("keydown", (e) => {
   if (!running) return;
   if (e.key === " ") e.preventDefault();   // space also scrolls the page
