@@ -1,0 +1,10 @@
+# Excluded from the Vercel web deploy only (files stay in git).
+# The browser app uses MediaPipe from CDN + optimized/ assets; these
+# ~42 MB of Python/YOLO files would only slow deploys and cold loads.
+best.pt
+best.onnx
+optimized/model
+__pycache__
+tests
+sharingan.py
+requirements.txt

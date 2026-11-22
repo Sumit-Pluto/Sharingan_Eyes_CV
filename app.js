@@ -375,10 +375,12 @@ function bakeFeather(sprite) {
 async function loadStages() {
   const urls = await stageUrls();
   const loaded = [];
-  const bust = `?v=${Date.now()}`;   // never serve a stale stage image
+  // No cache-busting query: stage URLs are stable, so the browser and
+  // the CDN can cache them (matters on mobile data). Fresh deploys
+  // revalidate via Cache-Control instead.
   for (const url of urls) {
     const img = new Image();
-    img.src = url + bust;
+    img.src = url;
     try { await img.decode(); } catch { continue; }
     loaded.push(bakeFeather(processAsset(img)));
   }
@@ -513,7 +515,7 @@ function blinkClosed(result, ear) {
 function playStageAudio() {
   if (!audioFiles.length) return;
   const url = audioFiles[currentIndex % audioFiles.length];
-  new Audio(`${url}?v=${Date.now()}`).play().catch(() => {});
+  new Audio(url).play().catch(() => {});
 }
 
 function awakeningEnergy(now) {
@@ -554,7 +556,10 @@ function snapshot() {
   const a = document.createElement("a");
   a.href = out.toDataURL("image/png");
   a.download = `sharingan_stage_${currentIndex + 1}.png`;
+  // iOS Safari ignores clicks on detached anchors: attach first.
+  document.body.appendChild(a);
   a.click();
+  a.remove();
 }
 
 // Per-stage motion, anime-accurate:
@@ -947,9 +952,17 @@ function loop() {
   try { result = landmarker.detectForVideo(video, performance.now()); }
   catch { return; }
 
-  if (video.videoWidth && canvas.width !== video.videoWidth) {
-    canvas.width = video.videoWidth;
-    canvas.height = video.videoHeight;
+  if (video.videoWidth) {
+    // Cap the overlay canvas: phones can expose 4K streams and
+    // per-frame full-res work drains battery. Landmarks are
+    // normalised, so a smaller canvas loses no tracking accuracy.
+    const scale = Math.min(1, 960 / Math.max(video.videoWidth, video.videoHeight));
+    const tw = Math.round(video.videoWidth * scale);
+    const th = Math.round(video.videoHeight * scale);
+    if (canvas.width !== tw || canvas.height !== th) {
+      canvas.width = tw;
+      canvas.height = th;
+    }
   }
   ctx.clearRect(0, 0, canvas.width, canvas.height);
 
@@ -1144,8 +1157,24 @@ async function prepare() {
     introStatus("Loading face model");
     if (!landmarker) landmarker = await initLandmarker();
     introStatus("Asking camera permission");
+    // Mobile-first constraints: front camera at a sane resolution.
+    // Unconstrained requests can resolve to 4K on phones (heat,
+    // battery, frame drops). Fall back to a bare request on devices
+    // that reject the ideal constraints.
+    const wantCamera = {
+      video: {
+        facingMode: "user",
+        width: { ideal: 1280, max: 1280 },
+        height: { ideal: 720, max: 1280 },
+      },
+      audio: false,
+    };
     try {
-      stream = await navigator.mediaDevices.getUserMedia({ video: true });
+      try {
+        stream = await navigator.mediaDevices.getUserMedia(wantCamera);
+      } catch {
+        stream = await navigator.mediaDevices.getUserMedia({ video: true });
+      }
     } catch (err) {
       throw new Error(err.name === "NotAllowedError"
         ? "Camera was blocked. Allow camera access for this site, "
@@ -1154,6 +1183,8 @@ async function prepare() {
           + "then press START to retry.");
     }
     video.srcObject = stream;
+    video.muted = true;
+    video.playsInline = true;
     await video.play();
     introStatus("Calibrating your eyes");
     await calibrateBehindIntro();
@@ -1208,7 +1239,7 @@ function openCameraView() {
   setStatus(earBaseline ? "Eyes open" : "Calibrating: look at the camera, eyes open…");
   // First stage audio, on this user gesture so the browser allows it.
   if (audioFiles.length) {
-    new Audio(`${audioFiles[0]}?v=${Date.now()}`).play().catch(() => {});
+    new Audio(audioFiles[0]).play().catch(() => {});
   }
   loop();
 }
@@ -1302,6 +1333,7 @@ resetBtn.addEventListener("click", () => setStage(0, performance.now()));
 snapBtn.addEventListener("click", snapshot);
 window.addEventListener("keydown", (e) => {
   if (!running) return;
+  if (e.key === " ") e.preventDefault();   // space also scrolls the page
   if (e.key === "n" || e.key === " ") setStage(currentIndex + 1, performance.now());
   else if (e.key === "p") setStage(currentIndex - 1, performance.now());
   else if (e.key === "r") setStage(0, performance.now());

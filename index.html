@@ -2,8 +2,12 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<meta name="description" content="Sharingan Eyes: blink to evolve through 12 stages, entirely in your browser.">
+<meta name="theme-color" content="#141010">
 <title>Sharingan Eyes — Browser</title>
+<link rel="preconnect" href="https://cdn.jsdelivr.net" crossorigin>
+<link rel="preconnect" href="https://storage.googleapis.com">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ccircle cx='50' cy='50' r='42' fill='%23c1272d'/%3E%3Ccircle cx='50' cy='50' r='12' fill='%23141010'/%3E%3C/svg%3E">
 <link rel="stylesheet" href="style.css">
 </head>
@@ -14,7 +18,7 @@
      when everything is ready. -->
 <div id="introScreen" class="intro-screen">
   <video id="introVideo" class="intro-video" src="intro.mp4"
-         autoplay playsinline></video>
+         autoplay muted playsinline preload="auto" disablepictureinpicture></video>
   <div class="intro-bottom">
     <p id="introLoading" class="intro-loading">
       Loading<span class="dots"><span>.</span><span>.</span><span>.</span></span>
@@ -50,7 +54,7 @@
   </header>
 
   <section class="stage-wrap">
-    <video id="video" playsinline muted></video>
+    <video id="video" playsinline muted disablepictureinpicture></video>
     <canvas id="overlay"></canvas>
     <div id="loading" class="loading" hidden>
       <div id="runners" class="runners"></div>
