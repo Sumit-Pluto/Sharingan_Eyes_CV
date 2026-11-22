@@ -1,0 +1,81 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Sharingan Eyes — Browser</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ccircle cx='50' cy='50' r='42' fill='%23c1272d'/%3E%3Ccircle cx='50' cy='50' r='12' fill='%23141010'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<!-- Intro / loading screen: intro video loops while the model,
+     camera and calibration prepare behind it. START appears only
+     when everything is ready. -->
+<div id="introScreen" class="intro-screen">
+  <video id="introVideo" class="intro-video" src="intro.mp4"
+         autoplay playsinline></video>
+  <div class="intro-bottom">
+    <p id="introLoading" class="intro-loading">
+      Loading<span class="dots"><span>.</span><span>.</span><span>.</span></span>
+    </p>
+    <p id="introError" class="intro-error" role="alert"></p>
+    <button id="introSoundBtn" class="intro-sound" type="button">TAP FOR SOUND</button>
+    <button id="introStartBtn" class="intro-start" type="button" hidden>START</button>
+  </div>
+</div>
+
+<!-- One-time instructions (reopenable via Help) -->
+<div id="helpModal" class="help-modal" hidden>
+  <div class="help-card">
+    <h2>How to evolve your Sharingan</h2>
+    <ol>
+      <li>Look at the camera with both eyes open.</li>
+      <li><strong>Close both eyes and hold them shut for 1–2 seconds</strong> — a quick blink will not count.</li>
+      <li>Open your eyes wide — your Sharingan evolves to the next stage.</li>
+      <li>Repeat to climb all 12 stages. The last (yellow) stage does not spin.</li>
+    </ol>
+    <p>You can also use Next / Prev / Reset, or the <strong>n</strong>, <strong>p</strong>, <strong>r</strong> keys.</p>
+    <button id="helpCloseBtn" class="help-close" type="button">Got it</button>
+  </div>
+</div>
+
+<main class="app">
+  <header class="app-header">
+    <div>
+      <h1>Sharingan Eyes</h1>
+      <p class="sub">Blink to evolve. Runs entirely in your browser — no server, no uploads.</p>
+    </div>
+    <button id="helpBtn" class="help-btn" type="button" title="Help / instructions">i&nbsp; Help</button>
+  </header>
+
+  <section class="stage-wrap">
+    <video id="video" playsinline muted></video>
+    <canvas id="overlay"></canvas>
+    <div id="loading" class="loading" hidden>
+      <div id="runners" class="runners"></div>
+      <p id="loadingText" class="loading-text">Loading…</p>
+    </div>
+    <div id="status" class="status">Press Start Camera</div>
+  </section>
+
+  <div class="controls">
+    <button id="startBtn" type="button">Start Camera</button>
+    <button id="stopBtn" type="button" disabled>Stop</button>
+    <button id="prevBtn" type="button" disabled>← Prev</button>
+    <button id="nextBtn" type="button" disabled>Next →</button>
+    <button id="resetBtn" type="button" disabled>Reset</button>
+    <button id="snapBtn" type="button" disabled>Snapshot</button>
+    <span id="stageLabel" class="stage-label">Stage –</span>
+    <span id="fpsLabel" class="fps-label"></span>
+  </div>
+
+
+
+  <p class="hint">Close <strong>both</strong> eyes, hold them shut a moment, then open to advance a stage. A quick flutter will not count.
+  The last (yellow) stage does not rotate. Press the buttons or just blink.</p>
+  <p id="error" class="error" role="alert"></p>
+</main>
+<script type="module" src="app.js"></script>
+</body>
+</html>

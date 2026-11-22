@@ -1,4 +1,6 @@
-opencv-python-headless==4.8.0.76  # For working with OpenCV without GUI support
-ultralytics==8.0.136              # For YOLO model usage
-numpy==1.23.5                     # For numerical operations
-pygame==2.1.2                     # For Audio Playback
+opencv-python==4.8.0.76  # GUI build: sharingan.py uses cv2.imshow/waitKey (headless cannot)
+# Do NOT downgrade ultralytics: best.pt was saved by 8.3.x, and older
+# versions cannot load it (AttributeError: Can't get attribute 'DFLoss').
+ultralytics==8.3.228
+numpy==1.26.4
+pygame==2.5.1            # Audio playback

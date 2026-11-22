@@ -1,0 +1,83 @@
+{
+  "model_onnx": "model/best.onnx",
+  "model_imgsz": 320,
+  "asset_max_size": 256,
+  "assets": [
+    {
+      "file": "1.png",
+      "before": 241883,
+      "after": 49348
+    },
+    {
+      "file": "2.png",
+      "before": 69839,
+      "after": 12897
+    },
+    {
+      "file": "3.png",
+      "before": 211308,
+      "after": 21700
+    },
+    {
+      "file": "4.png",
+      "before": 218346,
+      "after": 15333
+    },
+    {
+      "file": "5.png",
+      "before": 184014,
+      "after": 20049
+    },
+    {
+      "file": "6.png",
+      "before": 214314,
+      "after": 15493
+    },
+    {
+      "file": "7.png",
+      "before": 198426,
+      "after": 53977
+    },
+    {
+      "file": "8.png",
+      "before": 95669,
+      "after": 17730
+    },
+    {
+      "file": "9.png",
+      "before": 209353,
+      "after": 16756
+    },
+    {
+      "file": "10.png",
+      "before": 72364,
+      "after": 17350
+    },
+    {
+      "file": "11.png",
+      "before": 3912597,
+      "after": 73528
+    },
+    {
+      "file": "12.png",
+      "before": 408095,
+      "after": 21712
+    }
+  ],
+  "audio": [
+    "1.mp3",
+    "2.mp3",
+    "3.mp3",
+    "4.mp3",
+    "5.mp3",
+    "6.mp3",
+    "7.mp3",
+    "8.mp3",
+    "9.mp3",
+    "10.mp3",
+    "11.mp3",
+    "12.mp3"
+  ],
+  "assets_total_before": 6036208,
+  "assets_total_after": 335873
+}
