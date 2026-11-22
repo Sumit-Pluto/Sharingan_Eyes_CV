@@ -95,6 +95,7 @@ let latestEyeAt = 0;     // performance.now() of the last detection
 let eyeVelocities = [];  // per-eye smoothed velocity (normalised/s)
 let eyeLatencyMs = 50;   // smoothed detection time, for prediction
 let lastDrawAt = 0;      // last overlay draw, for draw throttling
+let eyeLights = [];      // per-eye smoothed {f, warm} local light
 let headYaw = 0;         // from the facial transformation matrix
 let earBaseline = null;  // personal open-eye EAR, calibrated at start
 let earSamples = [];
@@ -151,7 +152,7 @@ const fibreCanvas = (() => {   // radial iris fibres, rotates with the eye
   return c;
 })();
 
-let fxReduced = IS_TOUCH;   // phones start lite: grain/ripples cost frames
+let fxReduced = IS_TOUCH;   // phones start lite: grain/ghosts cost frames
 
 function updateLightFactor() {
   // Average luminance of the live feed, sampled cheaply every so
@@ -169,6 +170,35 @@ function updateLightFactor() {
     const target = 0.92 + (avg - 0.45) * 0.5;   // gentle, not a slave
     lightFactor += (Math.min(1.12, Math.max(0.72, target)) - lightFactor) * 0.2;
   } catch { /* video not ready yet */ }
+}
+
+function sampleEyeLight(eye, i) {
+  // Per-eye light: average the patch AROUND this eye (sclera/skin
+  // annulus, not the whole frame), so each disc is dimmed/warmed to
+  // its own corner of the photo. Returns smoothed {f, warm} or null.
+  try {
+    if (!video.videoWidth) return eyeLights[i] || null;
+    const vw = video.videoWidth, vh = video.videoHeight;
+    const s = Math.max(24, eye.r * vw * 7);
+    const sx = Math.min(vw - 1, Math.max(0, eye.x * vw - s / 2));
+    const sy = Math.min(vh - 1, Math.max(0, eye.y * vh - s / 2));
+    sampleCtx.drawImage(video, sx, sy, Math.min(s, vw - sx), Math.min(s, vh - sy),
+                        0, 0, sampleCanvas.width, sampleCanvas.height);
+    const d = sampleCtx.getImageData(0, 0, sampleCanvas.width, sampleCanvas.height).data;
+    let lum = 0, rSum = 0, bSum = 0, n = 0;
+    for (let p = 0; p < d.length; p += 16) {
+      lum += 0.2126 * d[p] + 0.7152 * d[p + 1] + 0.0722 * d[p + 2];
+      rSum += d[p]; bSum += d[p + 2]; n++;
+    }
+    if (!n) return eyeLights[i] || null;
+    const target = Math.min(1.12, Math.max(0.72, 0.92 + ((lum / n) / 255 - 0.45) * 0.5));
+    const warm = Math.min(1.25, Math.max(0.8, (rSum / n) / Math.max(1, bSum / n)));
+    const prev = eyeLights[i];
+    eyeLights[i] = prev
+      ? { f: prev.f + (target - prev.f) * 0.3, warm: prev.warm + (warm - prev.warm) * 0.3 }
+      : { f: target, warm };
+    return eyeLights[i];
+  } catch { return eyeLights[i] || null; }
 }
 const AMATERASU_STAGES = new Set([7, 8]);  // assets 8.png / 9.png (Sasuke)
 let eyesWereOpen = true;
@@ -463,20 +493,34 @@ function irisEye(landmarks, w, h, centreIdx, ringStart, upperIdx, lowerIdx,
   // eyelid gap divided by the iris diameter. Squinting shrinks the
   // gap, so the overlay contracts with the eye, like the YOLO pupil
   // box did; opening wide expands it back.
-  if (landmarks.length <= centreIdx) return null;
+  if (landmarks.length <= ringStart + 3) return null;
   const c = landmarks[centreIdx];
-  let rPx = 0;
-  for (let i = ringStart; i < ringStart + 4; i++) {
-    const p = landmarks[i];
-    rPx = Math.max(rPx, Math.hypot((p.x - c.x) * w, (p.y - c.y) * h));
-  }
+  const ring = [];
+  for (let i = ringStart; i < ringStart + 4; i++) ring.push(landmarks[i]);
+  // Radius: MEDIAN of the 4 centre-to-ring distances. The old max()
+  // amplified whichever ring point was noisiest that frame, so the
+  // disc pulsed by 1-3px even on a still face.
+  const dists = ring
+    .map((p) => Math.hypot((p.x - c.x) * w, (p.y - c.y) * h))
+    .sort((a, b) => a - b);
+  const rPx = (dists[1] + dists[2]) / 2;
+  // Centre: fuse the iris-centre landmark with the ring centroid
+  // (mean of the 4 ring points). Two partly independent estimates of
+  // the same point average out jitter the single landmark carries.
+  // Rejected when they disagree by >0.6r (blink/occlusion warps the
+  // ring), where the centre landmark alone is trusted.
+  const centroid = {
+    x: ring.reduce((s, p) => s + p.x, 0) / ring.length,
+    y: ring.reduce((s, p) => s + p.y, 0) / ring.length,
+  };
+  const fused = Math.hypot((centroid.x - c.x) * w, (centroid.y - c.y) * h) < 0.6 * Math.max(1, rPx)
+    ? { x: (c.x + centroid.x) / 2, y: (c.y + centroid.y) / 2 }
+    : c;
   const gapPx = Math.abs(landmarks[upperIdx].y - landmarks[lowerIdx].y) * h;
   const openness = Math.min(1, Math.max(0.12, gapPx / Math.max(1, 2 * rPx)));
   // Eyeball foreshortening: the visible iris is an ellipse, wider
   // than tall when facing forward and narrowing sideways as the
   // gaze/face turns. squash = visible width / height of the iris ring.
-  const ring = [];
-  for (let i = ringStart; i < ringStart + 4; i++) ring.push(landmarks[i]);
   const ringW = (Math.max(...ring.map((p) => p.x)) - Math.min(...ring.map((p) => p.x))) * w;
   const ringH = (Math.max(...ring.map((p) => p.y)) - Math.min(...ring.map((p) => p.y))) * h;
   const squash = Math.min(1, Math.max(0.55, ringW / Math.max(1, ringH)));
@@ -486,12 +530,16 @@ function irisEye(landmarks, w, h, centreIdx, ringStart, upperIdx, lowerIdx,
   // Gaze offset: iris centre relative to the eye-corner midpoint,
   // roughly -1..1 per axis. Used for the corneal-refraction shift:
   // the visible iris appears displaced toward the gaze direction.
+  // gy is normalised by eye HEIGHT (it used to divide by eyeW, the
+  // width, over/under-shooting vertical shifts by the eye aspect).
   const midX = (landmarks[cornerA].x + landmarks[cornerB].x) / 2;
   const midY = (landmarks[cornerA].y + landmarks[cornerB].y) / 2;
   const eyeW = Math.max(1e-4, Math.abs(landmarks[cornerA].x - landmarks[cornerB].x));
-  const gx = Math.max(-1, Math.min(1, (c.x - midX) / (eyeW / 2)));
-  const gy = Math.max(-1, Math.min(1, (c.y - midY) / (eyeW / 2)));
-  return { x: c.x, y: c.y, r: rPx / w, openness, contour, side, squash, gx, gy };
+  const contourH = Math.max(...contour.map((p) => p.y)) - Math.min(...contour.map((p) => p.y));
+  const eyeH = Math.max(1e-4, contourH, eyeW * (w / Math.max(1, h)) * 0.3);
+  const gx = Math.max(-1, Math.min(1, (fused.x - midX) / (eyeW / 2)));
+  const gy = Math.max(-1, Math.min(1, (fused.y - midY) / (eyeH / 2)));
+  return { x: fused.x, y: fused.y, r: rPx / w, openness, contour, side, squash, gx, gy };
 }
 
 function eyeCentres(landmarks, w, h) {
@@ -604,6 +652,25 @@ function stageMotion(index) {
   return { mode: "dilate" };
 }
 
+function traceSmoothContour(pts) {
+  // Smooth closed path through contour points (quadratic segments
+  // via midpoints): the raw 16-point polygon made the eyelid edge
+  // look faceted and crawl; this keeps the same points but curves.
+  if (pts.length < 3) {
+    pts.forEach((p, i) => { if (i === 0) ctx.moveTo(p.x, p.y); else ctx.lineTo(p.x, p.y); });
+    ctx.closePath();
+    return;
+  }
+  const mid = (a, b) => ({ x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 });
+  let m = mid(pts[pts.length - 1], pts[0]);
+  ctx.moveTo(m.x, m.y);
+  for (let i = 0; i < pts.length; i++) {
+    const next = mid(pts[i], pts[(i + 1) % pts.length]);
+    ctx.quadraticCurveTo(pts[i].x, pts[i].y, next.x, next.y);
+  }
+  ctx.closePath();
+}
+
 function drawEye(eye, now) {
   const w = canvas.width, h = canvas.height;
   // Corneal refraction: the iris seen through the cornea appears
@@ -639,43 +706,21 @@ function drawEye(eye, now) {
   // top/bottom of the circle exactly like they crop the real iris
   // (nobody sees a complete pupil). The circle itself is NOT squashed.
   if (eye.contour?.length > 2) {
-    // Expand the almond from the eye centre: clipping exactly on the
-    // eyelid line shaved too much and flattened circles into
-    // rectangles. ~20% taller / ~5% wider: eyelids visibly crop the
-    // circle, but gently.
+    // Expand the almond only slightly from the eye centre, and
+    // trace it as a smooth curve: the old 20% taller straight
+    // polygon let the iris poke past the lid on squint/blink and
+    // its faceted edge crawled. ~4% taller / ~5% wider still crops
+    // gently without re-exposing what the lid covers.
     // Rinnegan hugs the real lid line (whole-eye coverage); other
     // stages keep the gentler expanded crop.
     const expandX = motion.mode === "ripple" ? 1.0 : 1.05;
-    const expandY = motion.mode === "ripple" ? 1.02 : 1.20;
+    const expandY = motion.mode === "ripple" ? 1.02 : 1.04;
     ctx.beginPath();
-    eye.contour.forEach((p, i) => {
+    traceSmoothContour(eye.contour.map((p) => {
       const rawX = (1 - p.x) * w, rawY = p.y * h;
-      const px = cx + (rawX - cx) * expandX;
-      const py = cy + (rawY - cy) * expandY;
-      if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
-    });
-    ctx.closePath();
+      return { x: cx + (rawX - cx) * expandX, y: cy + (rawY - cy) * expandY };
+    }));
     ctx.clip();
-  }
-  // Eyelash shadow: a soft dark line hugging the upper eyelid,
-  // cast onto the eyeball (drawn before the disc, under it at rim).
-  if (eye.contour?.length > 8) {
-    ctx.save();
-    ctx.strokeStyle = "rgba(0, 0, 0, 0.38)";
-    ctx.lineWidth = Math.max(1.5, size * 0.055);
-    ctx.shadowColor = "rgba(0, 0, 0, 0.5)";
-    ctx.shadowBlur = IS_TOUCH ? 0 : size * 0.08;   // shadowBlur is dear on phones
-    ctx.lineCap = "round";
-    ctx.beginPath();
-    // Upper lid runs from one corner over the top to the other:
-    // the second half of the contour loop in our ordering.
-    const upper = eye.contour.slice(8);
-    upper.forEach((p, i) => {
-      const px = (1 - p.x) * w, py = p.y * h;
-      if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
-    });
-    ctx.stroke();
-    ctx.restore();
   }
   ctx.globalAlpha = OPACITY;
   ctx.translate(cx, cy);
@@ -703,7 +748,7 @@ function drawEye(eye, now) {
   // Live in the same photo as the face: slight blur, desaturation
   // and brightness matched to the webcam feed (sampled in the loop).
   // Canvas filters are very expensive on phone GPUs: skip on touch.
-  ctx.filter = IS_TOUCH ? "none" : `blur(0.4px) brightness(${lightFactor.toFixed(3)}) saturate(0.88)`;
+  ctx.filter = IS_TOUCH ? "none" : `blur(0.4px) brightness(${(eye.light ?? lightFactor).toFixed(3)}) saturate(0.88)`;
   // Spin motion blur: while the awakening spin is fast, ghost the
   // image at trailing angles instead of one crisp CGI rotation.
   const spinning = motion.mode === "spin"
@@ -753,6 +798,21 @@ function drawEye(eye, now) {
     ctx.beginPath();
     ctx.ellipse(cx, cy, drawW / 2, drawH / 2, 0, 0, Math.PI * 2);
     ctx.clip();
+    // Phones skip the canvas brightness filter, so apply this eye's
+    // local light as a plain tint here instead (darken/brighten +
+    // warm shift toward the sampled skin/sclera colour).
+    if (IS_TOUCH && eye.light !== undefined) {
+      const lf = eye.light;
+      ctx.globalAlpha = 1;
+      ctx.fillStyle = lf < 1
+        ? `rgba(0, 0, 0, ${((1 - lf) * 0.35).toFixed(3)})`
+        : `rgba(255, 240, 220, ${((lf - 1) * 0.6).toFixed(3)})`;
+      ctx.fillRect(cx - drawW / 2, cy - drawH / 2, drawW, drawH);
+      if (eye.warm > 1.04) {
+        ctx.fillStyle = `rgba(255, 160, 110, ${Math.min(0.10, (eye.warm - 1) * 0.4).toFixed(3)})`;
+        ctx.fillRect(cx - drawW / 2, cy - drawH / 2, drawW, drawH);
+      }
+    }
     if (energy > 0) {
       const inner = ctx.createRadialGradient(cx, cy, 0, cx, cy, size / 2);
       inner.addColorStop(0, `rgba(255, 120, 90, ${0.50 * energy})`);
@@ -779,18 +839,69 @@ function drawEye(eye, now) {
     shade.addColorStop(1, "rgba(0, 0, 0, 0.34)");
     ctx.fillStyle = shade;
     ctx.fillRect(cx - drawW / 2, cy - drawH / 2, drawW, drawH);
-    // 5b) Reflection that MOVES with your head (opposite the motion,
-    // like light fixed in the room while the eye moves under it).
-    const shiftX = Math.max(-1, Math.min(1, -(eye.vx || 0) * 22)) * size * 0.05;
-    const shiftY = Math.max(-1, Math.min(1, -(eye.vy || 0) * 22)) * size * 0.03;
+    // 5a2) Eyelash/lid shadow ON TOP of the disc (it used to be
+    // drawn before the disc, which then covered it): a dark line
+    // hugging the upper eyelid, so the top of the iris reads as
+    // seated inside the socket, deepening as the eye closes.
+    if (eye.contour?.length > 8) {
+      ctx.save();
+      ctx.strokeStyle = `rgba(0, 0, 0, ${0.34 + 0.25 * (1 - (eye.openness ?? 1))})`;
+      ctx.lineWidth = Math.max(1.5, size * 0.05);
+      ctx.shadowColor = "rgba(0, 0, 0, 0.5)";
+      ctx.shadowBlur = IS_TOUCH ? 0 : size * 0.07;
+      ctx.lineCap = "round";
+      ctx.beginPath();
+      // Upper lid runs from one corner over the top to the other:
+      // the second half of the contour loop in our ordering.
+      eye.contour.slice(8).forEach((p, i) => {
+        const px = (1 - p.x) * w, py = p.y * h;
+        if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+      });
+      ctx.stroke();
+      ctx.restore();
+      // Tear meniscus: the wet bright line where the lower lid
+      // meets the eyeball (first half of the contour loop).
+      ctx.save();
+      ctx.strokeStyle = "rgba(255, 255, 255, 0.28)";
+      ctx.lineWidth = Math.max(1, size * 0.014);
+      ctx.lineCap = "round";
+      ctx.beginPath();
+      eye.contour.slice(0, 8).forEach((p, i) => {
+        const px = (1 - p.x) * w, py = p.y * h;
+        if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+      });
+      ctx.stroke();
+      ctx.restore();
+    }
+    // 5b) World-locked reflection: the light is fixed in the room,
+    // the iris slides UNDER it. Anchored to the eye centre with a
+    // counter-shift against gaze, drawn after the spin/squash
+    // transforms were reset — it used to be shifted by the filter
+    // residual (vx/vy), so it jittered and spun with the design.
+    const specX = cx - size * 0.17 - (eye.gx || 0) * size * 0.10;
+    const specY = cy - size * 0.20 - (eye.gy || 0) * size * 0.07;
     ctx.fillStyle = "rgba(255, 255, 255, 0.18)";
     ctx.beginPath();
-    ctx.ellipse(cx - size * 0.17 + shiftX, cy - size * 0.20 + shiftY,
-                size * 0.042, size * 0.024, -0.6, 0, Math.PI * 2);
+    ctx.ellipse(specX, specY, size * 0.042, size * 0.024, -0.6, 0, Math.PI * 2);
     ctx.fill();
-    if (motion.mode === "ripple" && !fxReduced) {
+    // Hard catchlight (the sharp window/light reflection that makes
+    // an eye read as wet) plus a faint counter-highlight opposite.
+    ctx.fillStyle = "rgba(255, 255, 255, 0.85)";
+    ctx.beginPath();
+    ctx.ellipse(specX, specY, size * 0.018, size * 0.013, -0.6, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = "rgba(255, 255, 255, 0.12)";
+    ctx.beginPath();
+    ctx.ellipse(cx + size * 0.22 - (eye.gx || 0) * size * 0.10,
+                cy + size * 0.18 - (eye.gy || 0) * size * 0.07,
+                size * 0.03, size * 0.018, -0.6, 0, Math.PI * 2);
+    ctx.fill();
+    if (motion.mode === "ripple") {
       // Rinnegan: rings continuously expand from the pupil to the
       // rim of the eye, fading as they grow. Inside the disc only.
+      // NOT gated on fxReduced: this IS the stage's animation (two
+      // cheap ellipse strokes), not a decorative extra — gating it
+      // left stage 11 frozen on phones, which run lite by default.
       const phase = (now % 2200) / 2200;
       ctx.globalAlpha = 1;
       ctx.strokeStyle = "rgba(190, 140, 230, 0.85)";
@@ -815,13 +926,10 @@ function clipToEye(eye, expandX = 1, expandY = 1) {
   const w = canvas.width, h = canvas.height;
   const cx = (1 - eye.x) * w, cy = eye.y * h;
   ctx.beginPath();
-  (eye.contour || []).forEach((p, i) => {
+  traceSmoothContour((eye.contour || []).map((p) => {
     const rawX = (1 - p.x) * w, rawY = p.y * h;
-    const px = cx + (rawX - cx) * expandX;
-    const py = cy + (rawY - cy) * expandY;
-    if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
-  });
-  ctx.closePath();
+    return { x: cx + (rawX - cx) * expandX, y: cy + (rawY - cy) * expandY };
+  }));
   ctx.clip();
 }
 
@@ -1041,6 +1149,9 @@ function loop() {
         eyeVelocities = raw.map(() => ({ x: 0, y: 0 }));
         prevFiltered = [];
       }
+      if (eyeVelocities.length !== raw.length) {
+        eyeVelocities = raw.map(() => ({ x: 0, y: 0 }));
+      }
       const t = now / 1000;
       const dtPrev = prevFilteredAt ? Math.min(0.1, Math.max(1 / 240, t - prevFilteredAt)) : 0;
       const newPrev = [];
@@ -1055,7 +1166,10 @@ function loop() {
         // constant: fast enough to follow a real move, slow enough
         // that 8 Hz hand tremor mostly cancels out of it.
         if (prev && dtPrev > 0) {
-          const v = eyeVelocities[i];
+          // ?? guard: eyeVelocities must never be assumed to match
+          // the eye count — a missing entry used to throw here and
+          // kill the overlay for good ("reading 'x'").
+          const v = eyeVelocities[i] ?? (eyeVelocities[i] = { x: 0, y: 0 });
           const a = 1 - Math.exp(-dtPrev / 0.07);
           v.x += (Math.max(-2.0, Math.min(2.0, (fx - prev.x) / dtPrev)) - v.x) * a;
           v.y += (Math.max(-2.0, Math.min(2.0, (fy - prev.y) / dtPrev)) - v.y) * a;
@@ -1083,11 +1197,24 @@ function loop() {
       prevFiltered = newPrev;
       prevFilteredAt = t;
       latestEyeAt = performance.now();   // when the result landed
+      // Local light per eye, re-sampled every 15 detections (the
+      // stored smoothed value rides on every eye in between).
+      if (frames % 15 === 0) latestEyes.forEach((eye, i) => sampleEyeLight(eye, i));
+      latestEyes.forEach((eye, i) => {
+        const s = eyeLights[i];
+        if (s) { eye.light = s.f; eye.warm = s.warm; }
+      });
     } else if (!detectFailed) {
       // A real "no face" clears the overlay; a transient detector
       // error keeps the last eyes instead of blinking them off.
+      // Velocities are zeroed IN PLACE (same length as the filters)
+      // and prevFiltered is dropped: clearing eyeVelocities to []
+      // while keeping eyeFilters used to crash the next detection
+      // (eyeFilters matched, so velocities were never rebuilt), and
+      // a stale prev would fake a huge velocity across the gap.
       latestEyes = [];
-      eyeVelocities = [];
+      eyeVelocities = eyeVelocities.map(() => ({ x: 0, y: 0 }));
+      prevFiltered = [];
     }
   }
 
@@ -1199,7 +1326,7 @@ function loop() {
   if (now - fpsTimer >= 1000) {
     fpsLabel.textContent = `${frames} fps`;
     // Auto-quality: sustained low FPS sheds the expensive extras
-    // (grain, spin ghosts, ripples); recovering FPS restores them.
+    // (grain, spin ghosts); recovering FPS restores them.
     if (frames < 20) fxReduced = true;
     else if (frames > 26 && !IS_TOUCH) fxReduced = false;
     frames = 0; fpsTimer = now;
@@ -1286,6 +1413,19 @@ async function prepare() {
         facingMode: "user",
         width: IS_TOUCH ? { ideal: 480, max: 640 } : { ideal: 1280, max: 1280 },
         height: IS_TOUCH ? { ideal: 480, max: 640 } : { ideal: 720, max: 1280 },
+        frameRate: IS_TOUCH ? { ideal: 24, max: 30 } : { ideal: 30, max: 30 },
+      },
+      audio: false,
+    };
+    // Fallback ladder, never a bare {video:true}: that can return a
+    // 4K/60 stream and collapse detection on exactly the weak phones
+    // that needed the fallback.
+    const fallbackCamera = {
+      video: {
+        facingMode: "user",
+        width: { ideal: 480, max: 640 },
+        height: { ideal: 480, max: 640 },
+        frameRate: { ideal: 24, max: 30 },
       },
       audio: false,
     };
@@ -1293,7 +1433,7 @@ async function prepare() {
       try {
         stream = await navigator.mediaDevices.getUserMedia(wantCamera);
       } catch {
-        stream = await navigator.mediaDevices.getUserMedia({ video: true });
+        stream = await navigator.mediaDevices.getUserMedia(fallbackCamera);
       }
     } catch (err) {
       throw new Error(err.name === "NotAllowedError"
@@ -1393,6 +1533,7 @@ function stop() {
   latestEyeAt = 0;
   eyeVelocities = [];
   lastDrawAt = 0;
+  eyeLights = [];
   closedSince = null;
   closedFrames = 0;
   earBaseline = null;
