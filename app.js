@@ -631,10 +631,95 @@ function blinkClosed(result, ear) {
   return false;
 }
 
+// Stage audio, rebuilt after user reports of missing/stacked
+// sounds. The old code did `new Audio(url).play()` per stage: each
+// element loaded lazily, so on a slow phone several pending plays
+// resolved together and 3-5 stage sounds landed at once, while
+// others were rejected silently. Now: all clips are fetched and
+// decoded ONCE (total ~800KB) into WebAudio buffers during prepare,
+// one source plays at a time (a new stage stops the previous), and
+// if the AudioContext is not running the sound is DROPPED, never
+// queued — a suspended context would otherwise burst-play later.
+let audioCtx = null;
+let stageAudioBuffers = [];
+let stageAudioEls = [];      // HTMLAudio fallback if decode fails
+let currentAudioSource = null;
+let currentAudioEl = null;
+
+function ensureAudioContext() {
+  if (audioCtx) return audioCtx;
+  const AC = window.AudioContext || window.webkitAudioContext;
+  if (!AC) return null;
+  try { audioCtx = new AC(); } catch { audioCtx = null; }
+  return audioCtx;
+}
+
+function unlockAudio() {
+  // Called on real user gestures (taps): browsers only let audio
+  // run after one. Resuming here is what makes blink-triggered
+  // (non-gesture) stage sounds audible later.
+  const ctx = ensureAudioContext();
+  if (ctx && ctx.state === "suspended") ctx.resume().catch(() => {});
+}
+window.addEventListener("pointerdown", unlockAudio, { passive: true });
+window.addEventListener("keydown", unlockAudio);
+
+async function preloadStageAudio() {
+  stageAudioBuffers = [];
+  stageAudioEls = [];
+  if (!audioFiles.length) return;
+  const ctx = ensureAudioContext();
+  if (ctx) {
+    try {
+      stageAudioBuffers = await Promise.all(audioFiles.map(async (url) => {
+        const res = await fetch(url);
+        if (!res.ok) throw new Error(url);
+        return ctx.decodeAudioData(await res.arrayBuffer());
+      }));
+      return;   // WebAudio path ready
+    } catch { stageAudioBuffers = []; }
+  }
+  // Fallback: preload HTMLAudio masters (cloned per play).
+  stageAudioEls = audioFiles.map((url) => {
+    const a = new Audio();
+    a.preload = "auto";
+    a.src = url;
+    a.load();
+    return a;
+  });
+}
+
+function stopCurrentAudio() {
+  if (currentAudioSource) {
+    try { currentAudioSource.stop(); } catch {}
+    currentAudioSource = null;
+  }
+  if (currentAudioEl) {
+    try { currentAudioEl.pause(); currentAudioEl.currentTime = 0; } catch {}
+    currentAudioEl = null;
+  }
+}
+
 function playStageAudio() {
   if (!audioFiles.length) return;
-  const url = audioFiles[currentIndex % audioFiles.length];
-  new Audio(url).play().catch(() => {});
+  const idx = currentIndex % audioFiles.length;
+  stopCurrentAudio();   // latest stage wins: sounds never stack
+  if (stageAudioBuffers.length && audioCtx) {
+    if (audioCtx.state !== "running") return;   // drop, never queue
+    try {
+      const src = audioCtx.createBufferSource();
+      src.buffer = stageAudioBuffers[idx % stageAudioBuffers.length];
+      src.connect(audioCtx.destination);
+      src.onended = () => { if (currentAudioSource === src) currentAudioSource = null; };
+      currentAudioSource = src;
+      src.start();
+    } catch {}
+    return;
+  }
+  const master = stageAudioEls[idx];
+  const el = master ? master.cloneNode() : new Audio(audioFiles[idx]);
+  currentAudioEl = el;
+  el.play().catch(() => { if (currentAudioEl === el) currentAudioEl = null; });
 }
 
 function awakeningEnergy(now) {
@@ -1608,6 +1693,7 @@ async function prepare() {
     if (!stages.length) stages = await loadStages();
     if (!stages.length) throw new Error("No stage images found in assets/.");
     audioFiles = await audioUrls(stages.length);
+    await preloadStageAudio();   // decode once, so plays are instant
     introStatus("Loading face model");
     if (!landmarker) landmarker = await initLandmarker();
     introStatus("Asking camera permission");
@@ -1693,6 +1779,7 @@ function enterApp() {
 }
 
 function openCameraView() {
+  unlockAudio();   // this moment is a user gesture (START / Got it)
   awaitingFirstEntry = false;
   helpModal.hidden = true;
   introVideo.pause();
@@ -1731,6 +1818,7 @@ async function start() {
 function stop() {
   running = false;
   prepared = false;
+  stopCurrentAudio();
   if (rafId) cancelAnimationFrame(rafId);
   if (stream) stream.getTracks().forEach((t) => t.stop());
   stream = null;
